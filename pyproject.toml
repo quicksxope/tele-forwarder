@@ -1,0 +1,14 @@
+[project]
+name = "tele-forwarder"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "telethon>=1.36.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+tui = [
+    "textual>=0.75.0",
+    "ruamel.yaml>=0.18.0",
+]

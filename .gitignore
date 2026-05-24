@@ -1,0 +1,15 @@
+data/
+.venv/
+venv/
+__pycache__/
+.env
+
+# Legacy locations (pre data-dir migration)
+config.yaml
+secrets.yaml
+*.session
+*.session-journal
+mappings.db
+*.log
+rpc.sock
+bot.session

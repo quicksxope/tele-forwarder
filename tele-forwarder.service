@@ -1,0 +1,20 @@
+# Alternative to docker-compose — use one or the other, not both.
+# See CLAUDE.md for the docker-compose workflow (preferred for new installs).
+[Unit]
+Description=Telegram Message Forwarder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/opt/tele-forwarder
+Environment=TELE_FORWARDER_DATA_DIR=/opt/tele-forwarder/data
+ExecStart=/opt/tele-forwarder/.venv/bin/python forwarder.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

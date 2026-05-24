@@ -1,0 +1,15 @@
+data/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+*.log
+.git/
+.gitignore
+CLAUDE.md
+tui/
+tele-forwarder.service
+README*
+.claude/

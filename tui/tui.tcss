@@ -1,0 +1,15 @@
+Screen {
+    background: $surface;
+}
+
+Header {
+    dock: top;
+}
+
+Footer {
+    dock: bottom;
+}
+
+Static {
+    padding: 1 2;
+}

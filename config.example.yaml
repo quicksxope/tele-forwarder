@@ -1,0 +1,47 @@
+# restart_cmd is invoked by the TUI after you save or delete a rule.
+# Docker users:  docker compose restart forwarder
+# systemd users: systemctl --user restart tele-forwarder
+restart_cmd: docker compose restart forwarder
+
+sources:
+  # --- Example 1: Mirror an entire group (all topics) ---
+  - name: "Source Group Alpha"
+    chat_id: -1001234567890     # Negative ID for groups/channels
+    topics: all                 # 'all' forwards every topic and general chat
+    destination:
+      chat_id: -1009876543210   # Your destination group
+      topic_id: null            # null = general chat; set to a thread ID to target a topic
+    filters:
+      keywords: []              # Empty = forward everything regardless of text
+      media_types: []           # Empty = all types (text, photo, video, document, audio, gif)
+
+  # --- Example 2: Only specific topics, keyword-filtered ---
+  - name: "Source Group Beta - Signals topic only"
+    chat_id: -1001111111111
+    topics: [789, 1024]         # Only forward from these topic thread IDs
+    destination:
+      chat_id: -1009876543210
+      topic_id: null
+    filters:
+      keywords: ["BUY", "SELL", "ALERT"]   # Only messages containing these words
+      media_types: []
+
+  # --- Example 3: Photos and videos only, no text ---
+  - name: "Media-only mirror"
+    chat_id: -1002222222222
+    topics: all
+    destination:
+      chat_id: -1009876543210
+      topic_id: 55              # Forward into a specific topic in your destination
+    filters:
+      keywords: []
+      media_types: ["photo", "video"]   # Options: text, photo, video, audio, document, gif
+
+# How to find chat IDs:
+#   1. Forward any message from the group to @username_to_id_bot
+#   2. Or enable Telegram Web, open the group — the URL contains the ID
+#   3. Groups always have a negative ID starting with -100
+#
+# How to find topic thread IDs:
+#   1. Open the topic in Telegram Web
+#   2. The URL ends with /NNNNN — that number is the topic ID
