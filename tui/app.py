@@ -10,8 +10,8 @@ class ForwarderApp(App):
     CSS_PATH = "tui.tcss"
     SCREENS = {"dashboard": DashboardScreen, "rules": RulesListScreen}
     BINDINGS = [
-        ("d", "switch_screen('dashboard')", "Dashboard"),
-        ("r", "switch_screen('rules')", "Rules"),
+        ("1", "switch_screen('dashboard')", "Dashboard"),
+        ("2", "switch_screen('rules')", "Rules"),
         ("q", "quit", "Quit"),
     ]
 

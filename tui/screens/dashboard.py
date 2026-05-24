@@ -12,8 +12,6 @@ REFRESH_INTERVAL = 10  # seconds between stats refresh
 class DashboardScreen(Screen):
     BINDINGS = [("r", "refresh", "Refresh")]
 
-    daemon_status: reactive[str] = reactive("checking...")
-
     def compose(self) -> ComposeResult:
         yield Label("", id="health-badge")
         yield DataTable(id="stats-table")
