@@ -28,6 +28,7 @@ uv sync --extra tui
 mkdir -p data
 cp config.example.yaml data/config.yaml   # fill in rules (secrets go via wizard)
 uv run python -m tui setup                # first-time login: prompts phone + OTP, writes data/secrets.yaml and *.session
+                                          # (no --extra tui needed — wizard uses only base deps)
 uv run forwarder.py                       # subsequent runs: non-interactive
 ```
 
@@ -76,6 +77,44 @@ data/
 The path root is controlled by `TELE_FORWARDER_DATA_DIR` (default: `./data`). All paths are derived in `paths.py` — never hardcode paths elsewhere.
 
 > **macOS Docker Desktop**: bind-mounted Unix sockets may not be reachable from the host due to VirtioFS limitations. Run the daemon natively (`uv run forwarder.py`) for local Mac dev; use Docker only on a Linux VPS.
+
+## TUI key bindings
+
+App-level (work from any screen):
+
+| Key | Action |
+|-----|--------|
+| `1` | Switch to Dashboard |
+| `2` | Switch to Rules list |
+| `q` | Quit |
+
+Screen-local bindings (`r` and `d` are intentionally reserved for screen actions, which is why app navigation uses numbers):
+
+| Screen | Key | Action |
+|--------|-----|--------|
+| Dashboard | `r` | Refresh stats |
+| Rules | `a` | Add rule |
+| Rules | `e` | Edit selected rule |
+| Rules | `d` | Delete selected rule |
+| Rules | `r` | Refresh list |
+| Chat/Topic picker modals | `r` | Force-refresh dialog list |
+| Any modal | `Esc` | Dismiss |
+| Rule edit form | `Ctrl+S` | Save |
+| Rule edit form | `Esc` | Cancel |
+
+## Testing
+
+Use Textual's headless test runner for TUI smoke tests — no real terminal needed:
+
+```python
+async with app.run_test(headless=True) as pilot:
+    await pilot.pause(1.0)          # let on_mount workers settle
+    await pilot.press('2')          # navigate to rules
+    screen = app.screen             # app.screen is the active screen
+    table = screen.query_one('#rules-table', DataTable)
+```
+
+Unit tests for pure logic (config_io, stats) use `tempfile.TemporaryDirectory` with a real SQLite DB — no mocking.
 
 ## Key architectural facts
 
