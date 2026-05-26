@@ -39,17 +39,21 @@ class RulesListScreen(Screen):
         for rule in rules:
             name = rule.get('name', '(unnamed)')
             source_id = rule.get('chat_id', '?')
+            source_title = rule.get('source_title', '')
+            source_col = f"{source_title} ({source_id})" if source_title else str(source_id)
             topics = rule.get('topics', 'all')
             topics_str = 'all' if topics == 'all' else f"{len(topics)} topic(s)"
-            dest_id = (rule.get('destination') or {}).get('chat_id', '?')
+            dest = rule.get('destination') or {}
+            dest_id = dest.get('chat_id', '?')
+            dest_title = dest.get('title', '')
+            dest_col = f"{dest_title} ({dest_id})" if dest_title else str(dest_id)
             kw = rule.get('filters', {}).get('keywords') or []
             mt = rule.get('filters', {}).get('media_types') or []
             filters_str = ', '.join(
                 ([f"{len(kw)} kw"] if kw else []) +
                 ([f"{len(mt)} types"] if mt else [])
             ) or 'all'
-            # Show IDs directly — resolve_entity costs a round-trip; do it lazily
-            table.add_row(name, str(source_id), topics_str, str(dest_id), filters_str, key=str(rule.get('uuid', name)))
+            table.add_row(name, source_col, topics_str, dest_col, filters_str, key=str(rule.get('uuid', name)))
 
     def action_refresh(self) -> None:
         self.load_rules()

@@ -13,6 +13,12 @@ from tui.widgets.topic_picker import TopicPickerModal
 from paths import CONFIG_PATH
 
 
+def _chat_label(title: str, chat_id: int | None) -> str:
+    if not chat_id:
+        return "(none selected)"
+    return f"{title} ({chat_id})" if title else str(chat_id)
+
+
 class RuleEditScreen(Screen):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -27,10 +33,10 @@ class RuleEditScreen(Screen):
         self._is_new = rule is None
         # State for picker results
         self._source_chat_id: int | None = self._rule.get("chat_id")
-        self._source_title: str = ""
+        self._source_title: str = self._rule.get("source_title", "")
         self._source_is_forum: bool = False
         self._dest_chat_id: int | None = (self._rule.get("destination") or {}).get("chat_id")
-        self._dest_title: str = ""
+        self._dest_title: str = (self._rule.get("destination") or {}).get("title", "")
         self._dest_topic_id: int | None = (self._rule.get("destination") or {}).get("topic_id")
         # Tracks which picker was last opened: False = source, True = dest
         self._awaiting_dest: bool = False
@@ -48,9 +54,7 @@ class RuleEditScreen(Screen):
             )
 
             yield Label("Source chat")
-            src_label = (
-                f"{self._source_chat_id}" if self._source_chat_id else "(none selected)"
-            )
+            src_label = _chat_label(self._source_title, self._source_chat_id)
             yield Button(src_label, id="source-btn")
 
             yield Label("Source topics")
@@ -65,9 +69,7 @@ class RuleEditScreen(Screen):
             yield Button("Pick topic", id="pick-topic-btn")
 
             yield Label("Destination chat")
-            dest_label = (
-                f"{self._dest_chat_id}" if self._dest_chat_id else "(none selected)"
-            )
+            dest_label = _chat_label(self._dest_title, self._dest_chat_id)
             yield Button(dest_label, id="dest-btn")
 
             yield Label("Destination topic ID (optional)")
@@ -185,8 +187,13 @@ class RuleEditScreen(Screen):
         rule = {
             "name": name,
             "chat_id": self._source_chat_id,
+            "source_title": self._source_title,
             "topics": topics,
-            "destination": {"chat_id": self._dest_chat_id, "topic_id": dest_topic},
+            "destination": {
+                "chat_id": self._dest_chat_id,
+                "title": self._dest_title,
+                "topic_id": dest_topic,
+            },
             "filters": {"keywords": keywords, "media_types": media_types},
         }
         if "uuid" in self._rule:
