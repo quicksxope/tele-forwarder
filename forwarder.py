@@ -9,7 +9,7 @@ import yaml
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 from telethon import TelegramClient, events
-from telethon.tl.functions.channels import GetForumTopicsRequest
+from telethon.tl.functions.messages import GetForumTopicsRequest
 from telethon.tl.types import (
     MessageMediaPhoto,
     MessageMediaDocument,
@@ -116,6 +116,23 @@ def record_event(conn, source_chat_id, source_msg_id, status, error_text=None):
     conn.commit()
 
 
+def resolve_reply_to(db, message, dest_topic):
+    """Return the reply_to value to use when re-sending a message.
+
+    If the source message replies to a message we already forwarded, point to
+    the forwarded copy. Otherwise fall back to dest_topic (keeps forum thread).
+    """
+    if not message.reply_to:
+        return dest_topic
+    reply_msg_id = getattr(message.reply_to, 'reply_to_msg_id', None)
+    if not reply_msg_id:
+        return dest_topic
+    mapping = get_mapping(db, message.chat_id, reply_msg_id)
+    if mapping:
+        return mapping[1]  # dest_msg_id
+    return dest_topic
+
+
 def build_source_index(config):
     """Returns dict: chat_id -> list of rule dicts."""
     index = defaultdict(list)
@@ -171,41 +188,70 @@ def matches_rule(message, rule):
     return True
 
 
-async def resend_single(bot_client, rule, message):
+async def _download(user_client, message):
+    """Download media to a temp file, returning the path. Caller must delete it."""
+    import tempfile, os
+    from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+    if isinstance(message.media, MessageMediaPhoto):
+        ext = '.jpg'
+    elif isinstance(message.media, MessageMediaDocument):
+        from telethon.utils import get_extension
+        ext = get_extension(message.media.document) or '.bin'
+    else:
+        ext = ''
+    fd, path = tempfile.mkstemp(suffix=ext)
+    os.close(fd)
+    await user_client.download_media(message, file=path)
+    return path
+
+
+async def resend_single(user_client, bot_client, rule, message, reply_to=None):
     """Re-send a single message without the 'Forwarded from' header."""
+    import os
     dest_id = rule['destination']['chat_id']
-    dest_topic = rule['destination'].get('topic_id')
 
     if message.media:
-        sent = await bot_client.send_message(
-            entity=dest_id,
-            message=message.caption or '',
-            file=message.media,
-            reply_to=dest_topic,
-        )
+        path = await _download(user_client, message)
+        try:
+            caption = getattr(message, 'caption', None) or message.text or ''
+            sent = await bot_client.send_file(
+                entity=dest_id,
+                file=path,
+                caption=caption,
+                reply_to=reply_to,
+            )
+        finally:
+            os.unlink(path)
     else:
         sent = await bot_client.send_message(
             entity=dest_id,
             message=message.text or '',
-            reply_to=dest_topic,
+            reply_to=reply_to,
         )
     return sent
 
 
-async def resend_album(bot_client, rule, messages):
+async def resend_album(user_client, bot_client, rule, messages, reply_to=None):
     """Re-send a grouped album without the 'Forwarded from' header."""
+    import os
     dest_id = rule['destination']['chat_id']
-    dest_topic = rule['destination'].get('topic_id')
 
-    files = [m.media for m in messages]
-    caption = next((m.caption or m.text for m in messages if m.caption or m.text), '')
-
-    sent = await bot_client.send_file(
-        entity=dest_id,
-        file=files,
-        caption=caption,
-        reply_to=dest_topic,
-    )
+    paths = [await _download(user_client, m) for m in messages]
+    try:
+        caption = next(
+            (getattr(m, 'caption', None) or m.text for m in messages
+             if getattr(m, 'caption', None) or m.text),
+            ''
+        )
+        sent = await bot_client.send_file(
+            entity=dest_id,
+            file=paths,
+            caption=caption,
+            reply_to=reply_to,
+        )
+    finally:
+        for p in paths:
+            os.unlink(p)
     return sent if isinstance(sent, list) else [sent]
 
 
@@ -243,7 +289,9 @@ class Forwarder:
             messages = [m for m, _ in group]
             rule = group[0][1]
             try:
-                sent_list = await resend_album(self.bot_client, rule, messages)
+                dest_topic = rule['destination'].get('topic_id')
+                reply_to = resolve_reply_to(self.db, messages[0], dest_topic)
+                sent_list = await resend_album(self.user_client, self.bot_client, rule, messages, reply_to=reply_to)
                 dest_id = rule['destination']['chat_id']
                 for src_msg, sent in zip(messages, sent_list):
                     save_mapping(self.db, src_msg.chat_id, src_msg.id, dest_id, sent.id)
@@ -269,7 +317,9 @@ class Forwarder:
                     self._album_tasks[message.grouped_id] = task
             else:
                 try:
-                    sent = await resend_single(self.bot_client, rule, message)
+                    dest_topic = rule['destination'].get('topic_id')
+                    reply_to = resolve_reply_to(self.db, message, dest_topic)
+                    sent = await resend_single(self.user_client, self.bot_client, rule, message, reply_to=reply_to)
                     dest_id = rule['destination']['chat_id']
                     save_mapping(self.db, message.chat_id, message.id, dest_id, sent.id)
                     record_event(self.db, message.chat_id, message.id, 'ok')
@@ -348,7 +398,7 @@ async def rpc_server(user_client, start_time, socket_path):
     async def list_topics(params):
         chat_id = params['chat_id']
         result = await user_client(GetForumTopicsRequest(
-            channel=chat_id, offset_date=0, offset_id=0, offset_topic=0, limit=100
+            peer=chat_id, offset_date=None, offset_id=0, offset_topic=0, limit=100
         ))
         return [
             {'id': t.id, 'title': t.title, 'is_closed': getattr(t, 'closed', False)}

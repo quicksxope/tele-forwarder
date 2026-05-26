@@ -13,3 +13,22 @@ Footer {
 Static {
     padding: 1 2;
 }
+
+#form-scroll {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#form-actions {
+    margin-top: 1;
+    height: auto;
+}
+
+#source-topics-list,
+#dest-topics-list {
+    height: auto;
+    min-height: 1;
+    margin-left: 2;
+    margin-bottom: 1;
+}
+

@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from textual.app import ComposeResult
-from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, ListView, ListItem, Label
 from textual.binding import Binding
@@ -10,20 +9,21 @@ from textual import work
 _dialogs_cache: list[dict] | None = None
 
 
-class ChatPickerModal(ModalScreen):
-    """Modal to pick a Telegram chat from the user's dialog list."""
+@dataclass
+class ChatSelected:
+    chat_id: int
+    title: str
+    is_forum: bool
+    can_post: bool
 
+
+class ChatPickerModal(ModalScreen):
     BINDINGS = [
         Binding("escape", "dismiss", "Cancel"),
         Binding("r", "refresh", "Refresh"),
     ]
 
-    @dataclass
-    class Selected(Message):
-        chat_id: int
-        title: str
-        is_forum: bool
-        can_post: bool
+    Selected = ChatSelected
 
     def __init__(self, label: str = "Select chat"):
         super().__init__()
@@ -61,7 +61,6 @@ class ChatPickerModal(ModalScreen):
 
         self._all_dialogs = _dialogs_cache
         self._apply_filter("")
-        # Focus the filter input
         self.query_one("#filter-input", Input).focus()
 
     def _apply_filter(self, query: str) -> None:
@@ -72,24 +71,26 @@ class ChatPickerModal(ModalScreen):
         for d in self._filtered:
             warn = " ⚠" if not d.get('can_post', True) else ""
             forum = " [forum]" if d.get('is_forum') else ""
-            label_text = f"{d['title']}{forum}{warn}"
-            list_view.append(ListItem(Label(label_text)))
+            list_view.append(ListItem(Label(f"{d['title']}{forum}{warn}")))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "filter-input":
             self._apply_filter(event.value)
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Move focus to list when user presses Enter in the filter box
+        self.query_one("#chat-list", ListView).focus()
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        index = event.list_view.index
+        index = event.index
         if index is not None and 0 <= index < len(self._filtered):
             d = self._filtered[index]
-            self.post_message(self.Selected(
+            self.dismiss(ChatSelected(
                 chat_id=d['id'],
                 title=d['title'],
                 is_forum=d.get('is_forum', False),
                 can_post=d.get('can_post', True),
             ))
-            self.dismiss()
 
     def action_refresh(self) -> None:
         global _dialogs_cache

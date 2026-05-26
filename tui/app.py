@@ -1,4 +1,5 @@
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.widgets import Header, Footer
 
 from tui.screens.dashboard import DashboardScreen
@@ -10,9 +11,9 @@ class ForwarderApp(App):
     CSS_PATH = "tui.tcss"
     SCREENS = {"dashboard": DashboardScreen, "rules": RulesListScreen}
     BINDINGS = [
-        ("1", "switch_screen('dashboard')", "Dashboard"),
-        ("2", "switch_screen('rules')", "Rules"),
-        ("q", "quit", "Quit"),
+        Binding("1", "switch_screen('dashboard')", "Dashboard", priority=True),
+        Binding("2", "switch_screen('rules')", "Rules", priority=True),
+        Binding("q", "quit", "Quit", priority=True),
     ]
 
     def on_mount(self) -> None:

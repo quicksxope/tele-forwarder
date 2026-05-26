@@ -102,6 +102,25 @@ Screen-local bindings (`r` and `d` are intentionally reserved for screen actions
 | Rule edit form | `Ctrl+S` | Save |
 | Rule edit form | `Esc` | Cancel |
 
+## After making changes
+
+- **Any change to `forwarder.py`** — always restart the daemon immediately:
+  ```bash
+  pkill -f "forwarder.py"; sleep 1 && source $HOME/.local/bin/env && uv run forwarder.py &>> data/forwarder.log &
+  ```
+- **TUI changes** (`tui/`) — no restart needed; just re-launch the TUI.
+
+## Known API compatibility (Telethon 1.43.2 + Textual 8.x)
+
+These were broken in the original code and have been fixed:
+
+| Issue | Fix |
+|-------|-----|
+| `GetForumTopicsRequest` moved | Import from `telethon.tl.functions.messages`, not `channels`. Parameter is `peer=`, not `channel=`. `offset_date=None` not `0`. |
+| Textual `ListView.Selected` index | Use `event.index` (on the event), not `event.list_view.index` (reactive, can be `None`). |
+| Textual modal return values | Use `self.dismiss(result)` in the modal + `app.push_screen(modal, callback)` in the caller. `post_message` from a `ModalScreen` does not reach the screen that opened it. |
+| Textual app-level key bindings | Wrap in `Binding(..., priority=True)` so `DataTable` and other focusable widgets don't swallow `q`, `1`, `2`. |
+
 ## Testing
 
 Use Textual's headless test runner for TUI smoke tests — no real terminal needed:

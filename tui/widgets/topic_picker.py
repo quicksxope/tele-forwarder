@@ -1,23 +1,23 @@
 from dataclasses import dataclass
 from textual.app import ComposeResult
-from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, ListView, ListItem, Label
 from textual.binding import Binding
 from textual import work
 
 
-class TopicPickerModal(ModalScreen):
-    """Modal to pick a forum topic for a given chat."""
+@dataclass
+class TopicSelected:
+    topic_id: int
+    title: str
 
+
+class TopicPickerModal(ModalScreen):
     BINDINGS = [
         Binding("escape", "dismiss", "Cancel"),
     ]
 
-    @dataclass
-    class Selected(Message):
-        topic_id: int
-        title: str
+    Selected = TopicSelected
 
     def __init__(self, chat_id: int):
         super().__init__()
@@ -67,9 +67,12 @@ class TopicPickerModal(ModalScreen):
         if event.input.id == "filter-input":
             self._apply_filter(event.value)
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Move focus to list when user presses Enter in the filter box
+        self.query_one("#topic-list", ListView).focus()
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        index = event.list_view.index
+        index = event.index
         if index is not None and 0 <= index < len(self._filtered):
             t = self._filtered[index]
-            self.post_message(self.Selected(topic_id=t['id'], title=t['title']))
-            self.dismiss()
+            self.dismiss(TopicSelected(topic_id=t['id'], title=t['title']))
