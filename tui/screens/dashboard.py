@@ -14,6 +14,7 @@ class DashboardScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Label("", id="health-badge")
+        yield Label("", id="sync-badge")
         yield DataTable(id="stats-table")
         yield RichLog(id="log-tail", highlight=True, markup=True)
 
@@ -55,6 +56,31 @@ class DashboardScreen(Screen):
                     last = last[:16]  # trim to YYYY-MM-DD HH:MM
                 err_cell = f"[red]{s['error_count']}[/]" if s['error_count'] else str(s['error_count'])
                 table.add_row(s['name'], str(s['total_ok']), str(s['ok_24h']), err_cell, last)
+        except Exception:
+            pass
+
+        # Stats summary line
+        try:
+            sresp = await rpc_call('stats')
+            if sresp.get('ok'):
+                s = sresp['result']
+                today_count = s.get('forwarded_today', 0)
+                perm = s.get('permanent_failures', 0)
+                gap_ago = s.get('last_gap_fill_ago_s')
+                gap_count = s.get('last_gap_fill_count', 0)
+
+                if gap_ago is None:
+                    gap_str = "gap fill: pending"
+                elif gap_ago < 60:
+                    gap_str = f"gap fill: {gap_ago}s ago"
+                else:
+                    gap_str = f"gap fill: {gap_ago // 60}m ago"
+                if gap_count:
+                    gap_str += f" (+{gap_count} synced)"
+
+                perm_str = f"  [red]⚠ {perm} perm failures[/]" if perm else ""
+                sync_label = self.query_one("#sync-badge", Label)
+                sync_label.update(f"[dim]today: {today_count} forwarded  |  {gap_str}{perm_str}[/]")
         except Exception:
             pass
 

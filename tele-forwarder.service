@@ -7,11 +7,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=YOUR_LINUX_USER
-WorkingDirectory=/opt/tele-forwarder
-Environment=TELE_FORWARDER_DATA_DIR=/opt/tele-forwarder/data
-ExecStart=/opt/tele-forwarder/.venv/bin/python forwarder.py
-Restart=always
+User=devops
+WorkingDirectory=/home/devops/repo/tele-forwarder
+Environment=PATH=/home/devops/repo/tele-forwarder/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TELE_FORWARDER_DATA_DIR=/home/devops/repo/tele-forwarder/data
+ExecStart=/home/devops/repo/tele-forwarder/.venv/bin/python3 forwarder.py
+Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal

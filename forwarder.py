@@ -26,6 +26,7 @@ GAP_FILL_INTERVAL = 300   # seconds between gap-filler scans (5 min)
 GAP_FILL_BATCH    = 500   # max messages fetched per scan per chat
 CAPTION_MAX_LEN   = 1024  # Telegram hard limit for media captions
 TEXT_MAX_LEN      = 4096  # Telegram hard limit for plain text messages
+MAX_RETRIES       = 3     # give up forwarding a message after this many errors
 
 LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
 LOG_DATEFMT = '%Y-%m-%d %H:%M:%S'
@@ -142,6 +143,15 @@ def record_event(conn, source_chat_id, source_msg_id, status, error_text=None):
         (source_chat_id, source_msg_id, status, error_text),
     )
     conn.commit()
+
+
+def get_error_count(conn, source_chat_id, source_msg_id):
+    row = conn.execute(
+        "SELECT COUNT(*) FROM forward_events "
+        "WHERE source_chat_id=? AND source_msg_id=? AND status='error'",
+        (source_chat_id, source_msg_id),
+    ).fetchone()
+    return row[0] if row else 0
 
 
 def resolve_reply_to(db, message, dest_topic):
@@ -298,14 +308,79 @@ class Forwarder:
         # grouped_id -> list of (message, rule)
         self._album_buffer: dict[int, list] = defaultdict(list)
         self._album_tasks: dict[int, asyncio.Task] = {}
+        # Event handler refs for hot-reload
+        self._event_handlers: list[tuple] = []
+        # Gap fill stats
+        self._last_gap_fill_time: float | None = None
+        self._last_gap_fill_count: int = 0
+        self._permanent_failures: int = 0
 
     def register_handlers(self):
+        # Remove any previously registered handlers
+        for cb, ev in self._event_handlers:
+            self.user_client.remove_event_handler(cb, ev)
+        self._event_handlers.clear()
+
         source_ids = list(self.source_index.keys())
-        self.user_client.add_event_handler(self.on_new_message, events.NewMessage(chats=source_ids))
-        self.user_client.add_event_handler(self.on_message_edited, events.MessageEdited(chats=source_ids))
-        self.user_client.add_event_handler(self.on_message_deleted, events.MessageDeleted(chats=source_ids))
+        ev_new  = events.NewMessage(chats=source_ids)
+        ev_edit = events.MessageEdited(chats=source_ids)
+        ev_del  = events.MessageDeleted(chats=source_ids)
+
+        self.user_client.add_event_handler(self.on_new_message,     ev_new)
+        self.user_client.add_event_handler(self.on_message_edited,  ev_edit)
+        self.user_client.add_event_handler(self.on_message_deleted, ev_del)
+        self._event_handlers = [
+            (self.on_new_message,     ev_new),
+            (self.on_message_edited,  ev_edit),
+            (self.on_message_deleted, ev_del),
+        ]
         logger.info(f'Listening on {len(source_ids)} source chat(s)')
+
+    def start_background_tasks(self):
+        """Start background tasks once. Call from main(), not from register_handlers."""
         asyncio.ensure_future(self.gap_filler())
+        asyncio.ensure_future(self.db_housekeeping())
+        asyncio.ensure_future(self.config_watcher())
+
+    async def notify_owner(self, text: str) -> None:
+        owner_id = self.config.get('owner_id')
+        if not owner_id:
+            return
+        try:
+            await self.bot_client.send_message(int(owner_id), text)
+        except Exception as e:
+            logger.error(f'[notify_owner] Failed: {e}')
+
+    async def config_watcher(self):
+        import os as _os
+        path = str(paths.CONFIG_PATH)
+        mtime = _os.path.getmtime(path)
+        while True:
+            await asyncio.sleep(30)
+            try:
+                new_mtime = _os.path.getmtime(path)
+                if new_mtime != mtime:
+                    mtime = new_mtime
+                    self.config = load_config()
+                    self.source_index = build_source_index(self.config)
+                    self.register_handlers()
+                    logger.info(f'Config reloaded: {len(self.source_index)} source chat(s)')
+            except Exception as e:
+                logger.error(f'[config_watcher] Error: {e}')
+
+    async def db_housekeeping(self):
+        await asyncio.sleep(60)
+        while True:
+            try:
+                cur = self.db.execute(
+                    "DELETE FROM forward_events WHERE ts < datetime('now', '-30 days')"
+                )
+                self.db.commit()
+                if cur.rowcount > 0:
+                    logger.info(f'[housekeeping] Purged {cur.rowcount} old forward_events rows')
+            except Exception as e:
+                logger.error(f'[housekeeping] Error: {e}')
+            await asyncio.sleep(86400)
 
     async def gap_filler(self):
         """Runs at startup then every GAP_FILL_INTERVAL seconds.
@@ -320,73 +395,111 @@ class Forwarder:
             await asyncio.sleep(GAP_FILL_INTERVAL)
 
     async def _run_gap_fill(self):
+        total_sent = 0
         for chat_id, rules in self.source_index.items():
-            last_id = get_scan_state(self.db, chat_id)
-            msgs = []
-            async for msg in self.user_client.iter_messages(
-                chat_id, min_id=last_id, limit=GAP_FILL_BATCH
-            ):
-                msgs.append(msg)
+            # Loop in batches of GAP_FILL_BATCH (oldest-first) until fully caught up
+            while True:
+                last_id = get_scan_state(self.db, chat_id)
+                msgs = []
+                async for msg in self.user_client.iter_messages(
+                    chat_id, min_id=last_id, limit=GAP_FILL_BATCH, reverse=True
+                ):
+                    msgs.append(msg)
 
-            if not msgs:
-                continue
+                if not msgs:
+                    break
 
-            msgs.sort(key=lambda m: m.id)
-            new_last_id = msgs[-1].id
+                # msgs already arrive oldest-first due to reverse=True
+                new_last_id = msgs[-1].id
 
-            # Separate albums from singles
-            albums: dict[int, list] = defaultdict(list)
-            singles = []
-            for msg in msgs:
-                if msg.grouped_id:
-                    albums[msg.grouped_id].append(msg)
-                else:
-                    singles.append(msg)
+                albums: dict[int, list] = defaultdict(list)
+                singles = []
+                for msg in msgs:
+                    if msg.grouped_id:
+                        albums[msg.grouped_id].append(msg)
+                    else:
+                        singles.append(msg)
 
-            for grouped_id, album_msgs in albums.items():
-                album_msgs.sort(key=lambda m: m.id)
-                # If any member already mapped, the album was forwarded — skip
-                if any(get_mapping(self.db, chat_id, m.id) for m in album_msgs):
-                    continue
-                for rule in rules:
-                    if not matches_rule(album_msgs[0], rule):
+                for grouped_id, album_msgs in albums.items():
+                    album_msgs.sort(key=lambda m: m.id)
+                    if any(get_mapping(self.db, chat_id, m.id) for m in album_msgs):
                         continue
-                    try:
-                        dest_topic = rule['destination'].get('topic_id')
-                        reply_to = resolve_reply_to(self.db, album_msgs[0], dest_topic)
-                        sent_list = await resend_album(
-                            self.user_client, self.bot_client, rule, album_msgs, reply_to=reply_to
+                    first_id = album_msgs[0].id
+                    err_count = get_error_count(self.db, chat_id, first_id)
+                    if err_count >= MAX_RETRIES:
+                        logger.warning(
+                            f'[gap_fill] Skipping msg {first_id} (chat {chat_id}) — '
+                            f'permanent error after {MAX_RETRIES} retries'
                         )
-                        dest_id = rule['destination']['chat_id']
-                        for src_msg, sent in zip(album_msgs, sent_list):
-                            save_mapping(self.db, src_msg.chat_id, src_msg.id, dest_id, sent.id)
-                            record_event(self.db, src_msg.chat_id, src_msg.id, 'ok')
-                        logger.info(f'[gap_fill] Album {grouped_id} ({len(sent_list)}) → {dest_id}')
-                    except Exception as e:
-                        logger.error(f'[gap_fill] Album {grouped_id} failed: {e}')
-
-            for msg in singles:
-                if get_mapping(self.db, chat_id, msg.id):
-                    continue
-                for rule in rules:
-                    if not matches_rule(msg, rule):
+                        self._permanent_failures += 1
+                        await self.notify_owner(
+                            f'⚠️ Permanent forward failure: msg {first_id} in chat {chat_id} — '
+                            f'giving up after {MAX_RETRIES} retries.'
+                        )
                         continue
-                    try:
-                        dest_topic = rule['destination'].get('topic_id')
-                        reply_to = resolve_reply_to(self.db, msg, dest_topic)
-                        sent = await resend_single(
-                            self.user_client, self.bot_client, rule, msg, reply_to=reply_to
-                        )
-                        dest_id = rule['destination']['chat_id']
-                        save_mapping(self.db, msg.chat_id, msg.id, dest_id, sent.id)
-                        record_event(self.db, msg.chat_id, msg.id, 'ok')
-                        logger.info(f'[gap_fill] Msg {msg.id} → {dest_id}')
-                    except Exception as e:
-                        logger.error(f'[gap_fill] Msg {msg.id} failed: {e}')
+                    for rule in rules:
+                        if not matches_rule(album_msgs[0], rule):
+                            continue
+                        try:
+                            dest_topic = rule['destination'].get('topic_id')
+                            reply_to = resolve_reply_to(self.db, album_msgs[0], dest_topic)
+                            sent_list = await resend_album(
+                                self.user_client, self.bot_client, rule, album_msgs, reply_to=reply_to
+                            )
+                            dest_id = rule['destination']['chat_id']
+                            for src_msg, sent in zip(album_msgs, sent_list):
+                                save_mapping(self.db, src_msg.chat_id, src_msg.id, dest_id, sent.id)
+                                record_event(self.db, src_msg.chat_id, src_msg.id, 'ok')
+                            total_sent += len(sent_list)
+                            logger.info(f'[gap_fill] Album {grouped_id} ({len(sent_list)}) → {dest_id}')
+                        except Exception as e:
+                            for src_msg in album_msgs:
+                                record_event(self.db, src_msg.chat_id, src_msg.id, 'error', str(e))
+                            logger.error(f'[gap_fill] Album {grouped_id} failed: {e}')
 
-            set_scan_state(self.db, chat_id, new_last_id)
-            if new_last_id > last_id:
+                for msg in singles:
+                    if get_mapping(self.db, chat_id, msg.id):
+                        continue
+                    err_count = get_error_count(self.db, chat_id, msg.id)
+                    if err_count >= MAX_RETRIES:
+                        logger.warning(
+                            f'[gap_fill] Skipping msg {msg.id} (chat {chat_id}) — '
+                            f'permanent error after {MAX_RETRIES} retries'
+                        )
+                        self._permanent_failures += 1
+                        await self.notify_owner(
+                            f'⚠️ Permanent forward failure: msg {msg.id} in chat {chat_id} — '
+                            f'giving up after {MAX_RETRIES} retries.'
+                        )
+                        continue
+                    for rule in rules:
+                        if not matches_rule(msg, rule):
+                            continue
+                        try:
+                            dest_topic = rule['destination'].get('topic_id')
+                            reply_to = resolve_reply_to(self.db, msg, dest_topic)
+                            sent = await resend_single(
+                                self.user_client, self.bot_client, rule, msg, reply_to=reply_to
+                            )
+                            dest_id = rule['destination']['chat_id']
+                            save_mapping(self.db, msg.chat_id, msg.id, dest_id, sent.id)
+                            record_event(self.db, msg.chat_id, msg.id, 'ok')
+                            total_sent += 1
+                            logger.info(f'[gap_fill] Msg {msg.id} → {dest_id}')
+                        except Exception as e:
+                            record_event(self.db, msg.chat_id, msg.id, 'error', str(e))
+                            logger.error(f'[gap_fill] Msg {msg.id} failed: {e}')
+
+                set_scan_state(self.db, chat_id, new_last_id)
                 logger.info(f'[gap_fill] chat {chat_id}: scanned up to msg {new_last_id}')
+
+                if len(msgs) < GAP_FILL_BATCH:
+                    break  # fully caught up
+
+        if total_sent > 0:
+            self._last_gap_fill_time = time.monotonic()
+            self._last_gap_fill_count = total_sent
+            await self.notify_owner(f'📩 Gap fill: synced {total_sent} missed message(s).')
 
     async def _flush_album(self, grouped_id: int):
         await asyncio.sleep(ALBUM_FLUSH_DELAY)
@@ -431,6 +544,17 @@ class Forwarder:
                     task = asyncio.create_task(self._flush_album(message.grouped_id))
                     self._album_tasks[message.grouped_id] = task
             else:
+                err_count = get_error_count(self.db, message.chat_id, message.id)
+                if err_count >= MAX_RETRIES:
+                    logger.warning(
+                        f'Skipping msg {message.id} — permanent error after {MAX_RETRIES} retries'
+                    )
+                    self._permanent_failures += 1
+                    await self.notify_owner(
+                        f'⚠️ Permanent forward failure: msg {message.id} in chat {message.chat_id} — '
+                        f'giving up after {MAX_RETRIES} retries.'
+                    )
+                    continue
                 try:
                     dest_topic = rule['destination'].get('topic_id')
                     reply_to = resolve_reply_to(self.db, message, dest_topic)
@@ -475,7 +599,7 @@ class Forwarder:
                 logger.error(f'Delete sync failed for msg {source_msg_id}: {e}')
 
 
-async def rpc_server(user_client, start_time, socket_path):
+async def rpc_server(user_client, start_time, socket_path, db=None, forwarder=None):
     socket_path = os.path.expanduser(socket_path)
     parent = os.path.dirname(socket_path)
     if parent:
@@ -530,6 +654,47 @@ async def rpc_server(user_client, start_time, socket_path):
             'type': etype,
         }
 
+    async def stats(params):
+        from datetime import datetime
+        today = datetime.now().strftime('%Y-%m-%d')
+        forwarded_today = 0
+        total_forwarded = 0
+        perm_failures = 0
+        if db is not None:
+            forwarded_today = db.execute(
+                "SELECT COUNT(*) FROM forward_events WHERE status='ok' AND ts >= ?",
+                (today,)
+            ).fetchone()[0]
+            total_forwarded = db.execute(
+                "SELECT COUNT(*) FROM forward_events WHERE status='ok'"
+            ).fetchone()[0]
+            # Count distinct messages with >= MAX_RETRIES errors and no success
+            perm_failures = db.execute(
+                """SELECT COUNT(*) FROM (
+                    SELECT source_chat_id, source_msg_id
+                    FROM forward_events
+                    GROUP BY source_chat_id, source_msg_id
+                    HAVING SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) >= 3
+                       AND SUM(CASE WHEN status='ok'    THEN 1 ELSE 0 END) = 0
+                )"""
+            ).fetchone()[0]
+
+        gap_fill_ago = None
+        gap_fill_count = 0
+        if forwarder is not None:
+            gap_fill_count = forwarder._last_gap_fill_count
+            if forwarder._last_gap_fill_time is not None:
+                gap_fill_ago = int(time.monotonic() - forwarder._last_gap_fill_time)
+
+        return {
+            'uptime_s': time.monotonic() - start_time,
+            'forwarded_today': forwarded_today,
+            'total_forwarded': total_forwarded,
+            'permanent_failures': perm_failures,
+            'last_gap_fill_ago_s': gap_fill_ago,
+            'last_gap_fill_count': gap_fill_count,
+        }
+
     async def handle(reader, writer):
         try:
             line = await reader.readline()
@@ -545,6 +710,8 @@ async def rpc_server(user_client, start_time, socket_path):
                 result = await list_topics(params)
             elif method == 'resolve_entity':
                 result = await resolve_entity(params)
+            elif method == 'stats':
+                result = await stats(params)
             else:
                 result = None
                 raise ValueError(f'Unknown method: {method!r}')
@@ -593,9 +760,13 @@ async def main():
 
     forwarder = Forwarder(config, user_client, bot_client, db)
     forwarder.register_handlers()
+    forwarder.start_background_tasks()
 
     socket_path = str(paths.SOCKET_PATH)
-    asyncio.ensure_future(rpc_server(user_client, start_time, socket_path))
+    asyncio.ensure_future(rpc_server(user_client, start_time, socket_path, db=db, forwarder=forwarder))
+
+    source_count = len(forwarder.source_index)
+    await forwarder.notify_owner(f'✅ Forwarder started. Monitoring {source_count} source chat(s).')
 
     await user_client.run_until_disconnected()
 
