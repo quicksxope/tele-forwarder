@@ -120,6 +120,12 @@ These were broken in the original code and have been fixed:
 | Textual `ListView.Selected` index | Use `event.index` (on the event), not `event.list_view.index` (reactive, can be `None`). |
 | Textual modal return values | Use `self.dismiss(result)` in the modal + `app.push_screen(modal, callback)` in the caller. `post_message` from a `ModalScreen` does not reach the screen that opened it. |
 | Textual app-level key bindings | Wrap in `Binding(..., priority=True)` so `DataTable` and other focusable widgets don't swallow `q`, `1`, `2`. |
+| `message.caption` does not exist | Telethon 1.43.2 has no `.caption` attribute. Use `message.message` (plain text) instead. `message.text` returns markdown-formatted text (`**bold**`) which shows as literal asterisks unless parse_mode is set. |
+| Media cross-client reference | Never pass `message.media` directly to `bot_client.send_file()`. File references are tied to the uploading client. Always download to a temp file with the correct extension, then re-upload. |
+| Named temp files for photos | Use `tempfile.mkstemp(suffix='.jpg')` for photos. A suffix-less temp file loses mime type and arrives as "unnamed file". |
+| Telegram General topic (id=1) | Messages in General topic have `reply_to=None` (no thread marker). `get_message_topic()` returns `1` when `reply_to` is None. |
+| Album messages sent individually | Albums share `grouped_id`. When resending manually, group by `grouped_id` first and call `resend_album(messages)`. Never send album members one by one — they arrive as separate unrelated images. Only one message in an album carries the caption; the others have empty `message`. |
+| Daemon + resend script session conflict | Two Telethon processes cannot share the same `.session` file safely. Stop the daemon before running any standalone resend/test script. |
 
 ## Testing
 

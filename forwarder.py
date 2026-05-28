@@ -21,7 +21,11 @@ import paths
 
 logger = logging.getLogger(__name__)
 
-ALBUM_FLUSH_DELAY = 0.8  # seconds to wait before flushing a buffered album
+ALBUM_FLUSH_DELAY = 0.8   # seconds to wait before flushing a buffered album
+GAP_FILL_INTERVAL = 300   # seconds between gap-filler scans (5 min)
+GAP_FILL_BATCH    = 500   # max messages fetched per scan per chat
+CAPTION_MAX_LEN   = 1024  # Telegram hard limit for media captions
+TEXT_MAX_LEN      = 4096  # Telegram hard limit for plain text messages
 
 LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
 LOG_DATEFMT = '%Y-%m-%d %H:%M:%S'
@@ -71,6 +75,14 @@ def init_db(path=None):
         )
     ''')
     conn.execute('''
+        CREATE TABLE IF NOT EXISTS scan_state (
+            chat_id             INTEGER NOT NULL,
+            topic_id            INTEGER NOT NULL DEFAULT 0,
+            last_scanned_msg_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, topic_id)
+        )
+    ''')
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS forward_events (
             ts             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             source_chat_id INTEGER NOT NULL,
@@ -97,6 +109,22 @@ def get_mapping(conn, source_chat_id, source_msg_id):
         'WHERE source_chat_id=? AND source_msg_id=?',
         (source_chat_id, source_msg_id),
     ).fetchone()
+
+
+def get_scan_state(conn, chat_id, topic_id=0):
+    row = conn.execute(
+        'SELECT last_scanned_msg_id FROM scan_state WHERE chat_id=? AND topic_id=?',
+        (chat_id, topic_id),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def set_scan_state(conn, chat_id, last_msg_id, topic_id=0):
+    conn.execute(
+        'INSERT OR REPLACE INTO scan_state (chat_id, topic_id, last_scanned_msg_id) VALUES (?,?,?)',
+        (chat_id, topic_id, last_msg_id),
+    )
+    conn.commit()
 
 
 def get_mappings_for_ids(conn, source_chat_id, source_msg_ids):
@@ -142,9 +170,14 @@ def build_source_index(config):
 
 
 def get_message_topic(message):
-    """Return topic thread ID for messages inside a forum topic, else None."""
+    """Return topic thread ID for messages inside a forum topic, else None.
+
+    In Telegram forums, the General topic (id=1) never sets reply_to on its
+    messages. All other topics set reply_to_top_id (for replies) or
+    reply_to_msg_id (for top-level posts within the topic).
+    """
     if not message.reply_to:
-        return None
+        return 1  # No reply_to → General topic
     return message.reply_to.reply_to_top_id or message.reply_to.reply_to_msg_id
 
 
@@ -176,7 +209,7 @@ def matches_rule(message, rule):
     # Keyword filter (empty list = allow all)
     keywords = rule.get('filters', {}).get('keywords') or []
     if keywords:
-        text = (message.text or message.caption or '').lower()
+        text = (message.text or '').lower()
         if not any(kw.lower() in text for kw in keywords):
             return False
 
@@ -213,11 +246,11 @@ async def resend_single(user_client, bot_client, rule, message, reply_to=None):
     if message.media:
         path = await _download(user_client, message)
         try:
-            caption = getattr(message, 'caption', None) or message.text or ''
             sent = await bot_client.send_file(
                 entity=dest_id,
                 file=path,
-                caption=caption,
+                caption=(message.message or '')[:CAPTION_MAX_LEN],
+                formatting_entities=message.entities or [],
                 reply_to=reply_to,
             )
         finally:
@@ -225,7 +258,8 @@ async def resend_single(user_client, bot_client, rule, message, reply_to=None):
     else:
         sent = await bot_client.send_message(
             entity=dest_id,
-            message=message.text or '',
+            message=(message.message or '')[:TEXT_MAX_LEN],
+            formatting_entities=message.entities or [],
             reply_to=reply_to,
         )
     return sent
@@ -238,15 +272,14 @@ async def resend_album(user_client, bot_client, rule, messages, reply_to=None):
 
     paths = [await _download(user_client, m) for m in messages]
     try:
-        caption = next(
-            (getattr(m, 'caption', None) or m.text for m in messages
-             if getattr(m, 'caption', None) or m.text),
-            ''
-        )
+        caption_msg = next((m for m in messages if m.message), None)
+        caption = (caption_msg.message if caption_msg else '')[:CAPTION_MAX_LEN]
+        caption_entities = (caption_msg.entities or []) if caption_msg else []
         sent = await bot_client.send_file(
             entity=dest_id,
             file=paths,
             caption=caption,
+            formatting_entities=caption_entities,
             reply_to=reply_to,
         )
     finally:
@@ -272,6 +305,88 @@ class Forwarder:
         self.user_client.add_event_handler(self.on_message_edited, events.MessageEdited(chats=source_ids))
         self.user_client.add_event_handler(self.on_message_deleted, events.MessageDeleted(chats=source_ids))
         logger.info(f'Listening on {len(source_ids)} source chat(s)')
+        asyncio.ensure_future(self.gap_filler())
+
+    async def gap_filler(self):
+        """Runs at startup then every GAP_FILL_INTERVAL seconds.
+        Catches messages the live handler missed (daemon offline, transient send error).
+        """
+        await asyncio.sleep(10)  # let clients fully connect first
+        while True:
+            try:
+                await self._run_gap_fill()
+            except Exception as e:
+                logger.error(f'[gap_fill] Scan error: {e}')
+            await asyncio.sleep(GAP_FILL_INTERVAL)
+
+    async def _run_gap_fill(self):
+        for chat_id, rules in self.source_index.items():
+            last_id = get_scan_state(self.db, chat_id)
+            msgs = []
+            async for msg in self.user_client.iter_messages(
+                chat_id, min_id=last_id, limit=GAP_FILL_BATCH
+            ):
+                msgs.append(msg)
+
+            if not msgs:
+                continue
+
+            msgs.sort(key=lambda m: m.id)
+            new_last_id = msgs[-1].id
+
+            # Separate albums from singles
+            albums: dict[int, list] = defaultdict(list)
+            singles = []
+            for msg in msgs:
+                if msg.grouped_id:
+                    albums[msg.grouped_id].append(msg)
+                else:
+                    singles.append(msg)
+
+            for grouped_id, album_msgs in albums.items():
+                album_msgs.sort(key=lambda m: m.id)
+                # If any member already mapped, the album was forwarded — skip
+                if any(get_mapping(self.db, chat_id, m.id) for m in album_msgs):
+                    continue
+                for rule in rules:
+                    if not matches_rule(album_msgs[0], rule):
+                        continue
+                    try:
+                        dest_topic = rule['destination'].get('topic_id')
+                        reply_to = resolve_reply_to(self.db, album_msgs[0], dest_topic)
+                        sent_list = await resend_album(
+                            self.user_client, self.bot_client, rule, album_msgs, reply_to=reply_to
+                        )
+                        dest_id = rule['destination']['chat_id']
+                        for src_msg, sent in zip(album_msgs, sent_list):
+                            save_mapping(self.db, src_msg.chat_id, src_msg.id, dest_id, sent.id)
+                            record_event(self.db, src_msg.chat_id, src_msg.id, 'ok')
+                        logger.info(f'[gap_fill] Album {grouped_id} ({len(sent_list)}) → {dest_id}')
+                    except Exception as e:
+                        logger.error(f'[gap_fill] Album {grouped_id} failed: {e}')
+
+            for msg in singles:
+                if get_mapping(self.db, chat_id, msg.id):
+                    continue
+                for rule in rules:
+                    if not matches_rule(msg, rule):
+                        continue
+                    try:
+                        dest_topic = rule['destination'].get('topic_id')
+                        reply_to = resolve_reply_to(self.db, msg, dest_topic)
+                        sent = await resend_single(
+                            self.user_client, self.bot_client, rule, msg, reply_to=reply_to
+                        )
+                        dest_id = rule['destination']['chat_id']
+                        save_mapping(self.db, msg.chat_id, msg.id, dest_id, sent.id)
+                        record_event(self.db, msg.chat_id, msg.id, 'ok')
+                        logger.info(f'[gap_fill] Msg {msg.id} → {dest_id}')
+                    except Exception as e:
+                        logger.error(f'[gap_fill] Msg {msg.id} failed: {e}')
+
+            set_scan_state(self.db, chat_id, new_last_id)
+            if new_last_id > last_id:
+                logger.info(f'[gap_fill] chat {chat_id}: scanned up to msg {new_last_id}')
 
     async def _flush_album(self, grouped_id: int):
         await asyncio.sleep(ALBUM_FLUSH_DELAY)
@@ -338,7 +453,7 @@ class Forwarder:
             await self.bot_client.edit_message(
                 dest_chat_id,
                 dest_msg_id,
-                text=message.text or message.caption or '',
+                text=message.text or '',
             )
             logger.info(f'Edit synced: {message.id} → {dest_msg_id}')
         except Exception as e:
@@ -438,9 +553,13 @@ async def rpc_server(user_client, start_time, socket_path):
         except Exception as exc:
             response = json.dumps({'ok': False, 'error': str(exc)})
 
-        writer.write((response + '\n').encode())
-        await writer.drain()
-        writer.close()
+        try:
+            writer.write((response + '\n').encode())
+            await writer.drain()
+        except ConnectionResetError:
+            pass
+        finally:
+            writer.close()
 
     server = await asyncio.start_unix_server(handle, path=socket_path)
     logger.info(f'RPC server listening on {socket_path}')
