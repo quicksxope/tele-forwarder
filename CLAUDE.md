@@ -97,7 +97,7 @@ Screen-local bindings (`r` and `d` are intentionally reserved for screen actions
 | Rules | `e` | Edit selected rule |
 | Rules | `d` | Delete selected rule |
 | Rules | `r` | Refresh list |
-| Chat/Topic picker modals | `r` | Force-refresh dialog list |
+| Chat picker modal | `r` | Force-refresh dialog list |
 | Any modal | `Esc` | Dismiss |
 | Rule edit form | `Ctrl+S` | Save |
 | Rule edit form | `Esc` | Cancel |
@@ -161,11 +161,13 @@ Unit tests for pure logic (config_io, stats) use `tempfile.TemporaryDirectory` w
 
 `data/config.yaml` mirrors `config.example.yaml`. Critical fields per rule:
 - `chat_id` — negative integer (groups start with `-100`)
+- `source_title` — display name stored by TUI chat picker; daemon ignores it
 - `topics` — `'all'` or list of integer thread IDs
 - `destination.chat_id` / `destination.topic_id`
+- `destination.title` — display name stored by TUI chat picker; daemon ignores it
 - `filters.keywords` — empty list = pass all; non-empty = any-match required
 - `filters.media_types` — empty list = pass all; options: `text photo video audio document gif`
-- `restart_cmd` — top-level key; TUI runs this after saving a rule
+- `restart_cmd` — top-level key; TUI offers to run this after saving a rule (only if set)
 
 ## Deployment (systemd — alternative to Docker)
 

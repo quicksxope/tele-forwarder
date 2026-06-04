@@ -280,9 +280,12 @@ uv run --extra tui python -m tui
 | `e` | Edit selected rule |
 | `d` | Delete selected rule |
 | `r` | Refresh list |
-| **In pickers** | |
+| **In chat picker** | |
 | Type | Filter the list |
 | `r` | Force-refresh dialog list |
+| `Esc` | Cancel / close |
+| **In topic picker** | |
+| Type | Filter the list |
 | `Esc` | Cancel / close |
 | **In rule edit form** | |
 | `Ctrl+S` | Save |
