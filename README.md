@@ -123,9 +123,9 @@ Use the value of `"id"` exactly as shown (it's already negative).
 
 Forum groups have **topics** (threads). Each topic has its own integer ID. If you want to forward only specific topics, you need these IDs.
 
-### Method 1 — TUI topic picker (easiest)
+### Method 1 — TUI inline topic list (easiest)
 
-In the rule edit form, after selecting a **source chat** that is a forum group, the **Pick topic** button becomes active. Click it to see a list of all topics with their IDs. Selecting one adds its ID to the topics field automatically.
+In the rule edit form, after selecting a **source chat** that is a forum group, the form fetches that group's topics automatically and shows them as checkboxes. Check the topics you want — their IDs are written to the rule for you.
 
 ---
 
@@ -283,9 +283,6 @@ uv run --extra tui python -m tui
 | **In chat picker** | |
 | Type | Filter the list |
 | `r` | Force-refresh dialog list |
-| `Esc` | Cancel / close |
-| **In topic picker** | |
-| Type | Filter the list |
 | `Esc` | Cancel / close |
 | **In rule edit form** | |
 | `Ctrl+S` | Save |

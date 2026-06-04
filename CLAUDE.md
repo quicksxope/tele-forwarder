@@ -69,7 +69,7 @@ data/
 ├── secrets.yaml         # api_id, api_hash, bot_token (chmod 600)
 ├── forwarder.session    # Telethon session for personal account
 ├── bot.session          # Telethon session for bot
-├── mappings.db          # SQLite: message_map + forward_events (WAL mode)
+├── mappings.db          # SQLite: message_map + scan_state + forward_events (WAL mode)
 ├── forwarder.log        # rotating log (5 MB × 3 files)
 └── rpc.sock             # Unix socket for TUI ↔ daemon RPC
 ```
@@ -155,7 +155,17 @@ Unit tests for pure logic (config_io, stats) use `tempfile.TemporaryDirectory` w
 
 **Rule identity.** Each rule has a `uuid` field assigned on creation by the TUI (`config_io.ensure_rule_uuid`). The daemon tolerates rules without a uuid. The TUI uses uuid for stable identity across edits and hand-reorders of `config.yaml`.
 
-**RPC protocol.** JSON lines over a Unix socket. Daemon-side handler in `forwarder.py:rpc_server()`. TUI-side in `tui/rpc_client.py`. Methods: `health`, `list_dialogs`, `list_topics`, `resolve_entity`. Params are flat kwargs (no nested `params` key).
+**RPC protocol.** JSON lines over a Unix socket. Daemon-side handler in `forwarder.py:rpc_server()`. TUI-side in `tui/rpc_client.py`. Methods: `health`, `list_dialogs`, `list_topics`, `resolve_entity`, `stats`. Params are flat kwargs (no nested `params` key). `stats` returns `forwarded_today`, `total_forwarded`, `permanent_failures`, `last_gap_fill_ago_s`, `last_gap_fill_count`.
+
+**Gap filler.** On startup (after 10 s) and every `GAP_FILL_INTERVAL` (300 s), `gap_filler()` iterates each source chat from `scan_state.last_scanned_msg_id` and re-sends any messages that weren't live-forwarded. Useful after daemon downtime. After a successful run it DMs the owner (if `owner_id` is set).
+
+**Retry logic.** Each send attempt is recorded in `forward_events`. If `status='error'` accumulates ≥ `MAX_RETRIES` (3) with no success for a given message, the message is flagged as a permanent failure, counted in `Forwarder._permanent_failures`, and the owner is notified. Permanent failures are surfaced on the dashboard.
+
+**Config hot-reload.** `config_watcher()` polls `config.yaml` every 30 s. On mtime change it reloads the config, rebuilds `source_index`, and re-registers event handlers — no daemon restart needed for rule changes.
+
+**DB housekeeping.** `db_housekeeping()` purges `forward_events` rows older than 30 days, running once per day.
+
+**Media download.** `_download(user_client, message)` saves media to a temp file (with the correct extension, e.g. `.jpg`) before the bot re-uploads it. This is required because Telethon file references are bound to the client that received them.
 
 ## Config shape
 
@@ -167,7 +177,10 @@ Unit tests for pure logic (config_io, stats) use `tempfile.TemporaryDirectory` w
 - `destination.title` — display name stored by TUI chat picker; daemon ignores it
 - `filters.keywords` — empty list = pass all; non-empty = any-match required
 - `filters.media_types` — empty list = pass all; options: `text photo video audio document gif`
-- `restart_cmd` — top-level key; TUI offers to run this after saving a rule (only if set)
+
+Top-level keys:
+- `restart_cmd` — TUI offers to run this after saving a rule (only if set)
+- `owner_id` — your personal Telegram user ID; daemon DMs you on gap-fill completion and permanent failures
 
 ## Deployment (systemd — alternative to Docker)
 
