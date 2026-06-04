@@ -74,7 +74,7 @@ data/
 └── rpc.sock             # Unix socket for TUI ↔ daemon RPC
 ```
 
-The path root is controlled by `TELE_FORWARDER_DATA_DIR` (default: `./data`). All paths are derived in `paths.py` — never hardcode paths elsewhere.
+The path root is controlled by `TELE_FORWARDER_DATA_DIR` (default: `./data`) or the `--data-dir` CLI flag (takes precedence). All paths are derived in `paths.py` — never hardcode paths elsewhere.
 
 > **macOS Docker Desktop**: bind-mounted Unix sockets may not be reachable from the host due to VirtioFS limitations. Run the daemon natively (`uv run forwarder.py`) for local Mac dev; use Docker only on a Linux VPS.
 
@@ -106,9 +106,25 @@ Screen-local bindings (`r` and `d` are intentionally reserved for screen actions
 
 - **Any change to `forwarder.py`** — always restart the daemon immediately:
   ```bash
+  # Default data dir
   pkill -f "forwarder.py"; sleep 1 && source $HOME/.local/bin/env && uv run forwarder.py &>> data/forwarder.log &
+
+  # Named instance
+  pkill -f "data/alice"; sleep 1 && uv run forwarder.py --data-dir data/alice &>> data/alice/forwarder.log &
   ```
 - **TUI changes** (`tui/`) — no restart needed; just re-launch the TUI.
+
+## Multiple instances
+
+Each instance is isolated by its data directory. Provision a new one with:
+
+```bash
+./new-instance.sh alice        # creates data/alice/, copies config, runs wizard
+uv run forwarder.py --data-dir data/alice &
+uv run --extra tui python -m tui --data-dir data/alice
+```
+
+The `--data-dir` flag sets `TELE_FORWARDER_DATA_DIR` before `paths.py` is imported, so it takes precedence over the env var. Both forms work; prefer `--data-dir` for clarity.
 
 ## Known API compatibility (Telethon 1.43.2 + Textual 8.x)
 

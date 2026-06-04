@@ -65,6 +65,10 @@ Telegram requires every client app to identify itself with an `api_id` and `api_
 
 ## Quick setup
 
+Before starting, make sure you have:
+- Your `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) (see [previous section](#getting-your-api_id-and-api_hash))
+- A bot token from [@BotFather](https://t.me/BotFather)
+
 ```bash
 # 1. Clone and install
 git clone https://github.com/vrieza/tele-forwarder
@@ -79,9 +83,7 @@ cp config.example.yaml data/config.yaml
 uv run python -m tui setup
 ```
 
-The wizard does two things:
-- Logs you into your **personal account** (prompts for phone number + OTP, saves `data/forwarder.session`)
-- Validates your **bot token** and saves `data/secrets.yaml` (chmod 600)
+The wizard prompts for your `api_id`, `api_hash`, phone number (OTP), and bot token, then writes `data/secrets.yaml` (chmod 600) and `data/*.session`.
 
 After setup, `data/` contains everything the daemon needs to run non-interactively.
 
@@ -267,7 +269,8 @@ sources:
 ### Local dev (no Docker)
 
 ```bash
-uv run forwarder.py
+uv run forwarder.py                        # uses ./data/ by default
+uv run forwarder.py --data-dir data/alice  # explicit data dir (multi-instance)
 ```
 
 Logs go to `data/forwarder.log` and stdout.
@@ -377,7 +380,8 @@ uv run --extra tui python -m tui --data-dir data/alice
 The TUI runs on the **host**, never inside the container. It connects to the daemon over a Unix socket (`data/rpc.sock`).
 
 ```bash
-uv run --extra tui python -m tui
+uv run --extra tui python -m tui                        # default ./data/
+uv run --extra tui python -m tui --data-dir data/alice  # specific instance
 ```
 
 ### Key bindings
