@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+import argparse as _argparse
+import os as _os
+
+# Parse --data-dir before importing paths, since paths reads TELE_FORWARDER_DATA_DIR at import time.
+_p = _argparse.ArgumentParser(add_help=False)
+_p.add_argument('--data-dir', metavar='DIR')
+_early, _ = _p.parse_known_args()
+if _early.data_dir:
+    _os.environ['TELE_FORWARDER_DATA_DIR'] = _early.data_dir
+
 import asyncio
 import json
 import logging

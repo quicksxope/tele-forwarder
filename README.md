@@ -9,13 +9,15 @@ Self-hosted Telegram message forwarder. Monitors private groups/channels you're 
 ## Table of contents
 
 1. [Prerequisites](#prerequisites)
-2. [Quick setup](#quick-setup)
-3. [Finding chat IDs](#finding-chat-ids)
-4. [Finding topic IDs (forum groups)](#finding-topic-ids-forum-groups)
-5. [Writing your first rule](#writing-your-first-rule)
-6. [Running the daemon](#running-the-daemon)
-7. [Managing rules with the TUI](#managing-rules-with-the-tui)
-8. [Troubleshooting](#troubleshooting)
+2. [Getting your api\_id and api\_hash](#getting-your-api_id-and-api_hash)
+3. [Quick setup](#quick-setup)
+4. [Finding chat IDs](#finding-chat-ids)
+5. [Finding topic IDs (forum groups)](#finding-topic-ids-forum-groups)
+6. [Writing your first rule](#writing-your-first-rule)
+7. [Running the daemon](#running-the-daemon)
+8. [Running multiple instances](#running-multiple-instances)
+9. [Managing rules with the TUI](#managing-rules-with-the-tui)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -24,7 +26,40 @@ Self-hosted Telegram message forwarder. Monitors private groups/channels you're 
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - A Telegram account
 - A Telegram bot (created via [@BotFather](https://t.me/BotFather))
+- Your own `api_id` and `api_hash` from Telegram (see next section)
 - Docker + docker compose (for production deploy — optional for local dev)
+
+---
+
+## Getting your api\_id and api\_hash
+
+Telegram requires every client app to identify itself with an `api_id` and `api_hash`. You register your own at [my.telegram.org](https://my.telegram.org) — it's free and takes two minutes.
+
+> **Important:** Each person running this forwarder should register their own `api_id`. Do not share yours. Telegram monitors `api_id` usage patterns, and sharing one across multiple unrelated accounts risks getting it banned.
+
+### Steps
+
+1. Go to [my.telegram.org](https://my.telegram.org) and log in with your phone number (it sends an OTP via Telegram, same as login).
+
+2. Click **API development tools**.
+
+3. Fill in the form:
+   - **App title**: anything (e.g. `My Forwarder`)
+   - **Short name**: anything lowercase, no spaces (e.g. `myforwarder`)
+   - **Platform**: Other
+   - **Description**: leave blank or add a note
+
+4. Click **Create application**.
+
+5. You'll see your credentials:
+   ```
+   App api_id:    12345678
+   App api_hash:  0123456789abcdef0123456789abcdef
+   ```
+
+   Copy both — the setup wizard will ask for them.
+
+> **Keep these secret.** Anyone with your `api_id` + `api_hash` + session file can act as your Telegram account. The wizard stores them in `data/secrets.yaml` (chmod 600).
 
 ---
 
@@ -257,6 +292,83 @@ docker compose logs -f forwarder
 ```
 
 The daemon auto-restarts on crash or reboot (`restart: unless-stopped`).
+
+---
+
+## Running multiple instances
+
+Each instance is fully isolated: its own Telegram session, secrets, config, database, log, and RPC socket — all under its own data directory.
+
+### Quick start (host, no Docker)
+
+Use the helper script to create and set up a new instance:
+
+```bash
+./new-instance.sh alice
+```
+
+This creates `data/alice/`, copies the example config, and runs the setup wizard for that instance. Repeat for each additional user.
+
+To start all instances:
+
+```bash
+uv run forwarder.py --data-dir data/alice &
+uv run forwarder.py --data-dir data/bob   &
+```
+
+To open the TUI for a specific instance:
+
+```bash
+uv run --extra tui python -m tui --data-dir data/alice
+```
+
+### Docker Compose (multi-instance)
+
+Add one service per instance in `docker-compose.yml`:
+
+```yaml
+services:
+  forwarder-alice:
+    build: .
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./data/alice:/data
+    environment:
+      TELE_FORWARDER_DATA_DIR: /data
+
+  forwarder-bob:
+    build: .
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./data/bob:/data
+    environment:
+      TELE_FORWARDER_DATA_DIR: /data
+```
+
+Run the setup wizard on the host first for each instance before starting Docker:
+
+```bash
+./new-instance.sh alice   # creates data/alice/ and runs wizard
+./new-instance.sh bob     # creates data/bob/ and runs wizard
+
+echo "UID=$(id -u)" >> .env
+echo "GID=$(id -g)" >> .env
+docker compose up -d
+```
+
+The TUI always runs on the host — point it at the right instance with `--data-dir`:
+
+```bash
+uv run --extra tui python -m tui --data-dir data/alice
+```
+
+### API restrictions on same IP
+
+`FloodWaitError` is per-account, not per-IP — instances don't share rate limit budgets. Running 5–10 instances on one VPS is fine operationally. The one constraint that matters:
+
+> Each instance should use its **own** `api_id`/`api_hash` (registered at [my.telegram.org](https://my.telegram.org) by each user). Sharing one `api_id` across multiple unrelated accounts is a Telegram ToS violation and risks getting the key banned.
 
 ---
 
