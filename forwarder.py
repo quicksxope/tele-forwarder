@@ -16,6 +16,7 @@ import os
 import sqlite3
 import time
 import yaml
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 from telethon import TelegramClient, events
@@ -127,7 +128,7 @@ def get_scan_state(conn, chat_id, topic_id=0):
         'SELECT last_scanned_msg_id FROM scan_state WHERE chat_id=? AND topic_id=?',
         (chat_id, topic_id),
     ).fetchone()
-    return row[0] if row else 0
+    return row[0] if row else None
 
 
 def set_scan_state(conn, chat_id, last_msg_id, topic_id=0):
@@ -320,31 +321,98 @@ class Forwarder:
         self._album_tasks: dict[int, asyncio.Task] = {}
         # Event handler refs for hot-reload
         self._event_handlers: list[tuple] = []
+        self._initial_days: int = int(config.get('gap_fill_initial_days', 7))
         # Gap fill stats
         self._last_gap_fill_time: float | None = None
         self._last_gap_fill_count: int = 0
         self._permanent_failures: int = 0
 
     def register_handlers(self):
-        # Remove any previously registered handlers
-        for cb, ev in self._event_handlers:
-            self.user_client.remove_event_handler(cb, ev)
+        # Remove any previously registered handlers (user + bot)
+        for client, cb, ev in self._event_handlers:
+            client.remove_event_handler(cb, ev)
         self._event_handlers.clear()
 
         source_ids = list(self.source_index.keys())
         ev_new  = events.NewMessage(chats=source_ids)
         ev_edit = events.MessageEdited(chats=source_ids)
         ev_del  = events.MessageDeleted(chats=source_ids)
+        ev_cmd  = events.NewMessage(pattern=r'^/(status|rules)(@\w+)?$')
 
         self.user_client.add_event_handler(self.on_new_message,     ev_new)
         self.user_client.add_event_handler(self.on_message_edited,  ev_edit)
         self.user_client.add_event_handler(self.on_message_deleted, ev_del)
+        self.bot_client.add_event_handler(self.on_bot_command,      ev_cmd)
         self._event_handlers = [
-            (self.on_new_message,     ev_new),
-            (self.on_message_edited,  ev_edit),
-            (self.on_message_deleted, ev_del),
+            (self.user_client, self.on_new_message,     ev_new),
+            (self.user_client, self.on_message_edited,  ev_edit),
+            (self.user_client, self.on_message_deleted, ev_del),
+            (self.bot_client,  self.on_bot_command,     ev_cmd),
         ]
         logger.info(f'Listening on {len(source_ids)} source chat(s)')
+
+    async def on_bot_command(self, event):
+        owner_id = self.config.get('owner_id')
+        if owner_id and event.sender_id != int(owner_id):
+            return
+
+        me = await self.user_client.get_me()
+        name = ' '.join(filter(None, [me.first_name, me.last_name]))
+        phone = f'+{me.phone}' if me.phone else 'unknown'
+
+        lines = [
+            f'🤖 Forwarder — {paths.DATA_DIR}',
+            f'',
+            f'👤 Account: {name} ({phone})',
+            f'',
+        ]
+
+        rules = self.config.get('sources', [])
+        lines.append(f'📋 Active Rules ({len(rules)}):')
+
+        for i, rule in enumerate(rules, 1):
+            src_id  = rule.get('chat_id', '?')
+            dst     = rule.get('destination', {})
+            dst_id  = dst.get('chat_id', '?')
+            dst_topic = dst.get('topic_id')
+            topics  = rule.get('topics', 'all')
+            kw      = rule.get('filters', {}).get('keywords', [])
+            mt      = rule.get('filters', {}).get('media_types', [])
+            name_label = rule.get('name', f'Rule {i}')
+
+            try:
+                src_entity = await self.user_client.get_entity(int(src_id))
+                src_title = getattr(src_entity, 'title', str(src_id))
+            except Exception:
+                src_title = str(src_id)
+
+            try:
+                dst_entity = await self.bot_client.get_entity(int(dst_id))
+                dst_title = getattr(dst_entity, 'title', str(dst_id))
+            except Exception:
+                dst_title = str(dst_id)
+
+            topic_str = 'all' if topics == 'all' else ', '.join(str(t) for t in topics)
+            dst_str = f'{dst_title}'
+            if dst_topic:
+                dst_str += f' › topic {dst_topic}'
+            filter_parts = []
+            if kw:
+                filter_parts.append(f'keywords: {", ".join(kw)}')
+            if mt:
+                filter_parts.append(f'media: {", ".join(mt)}')
+            filter_str = ' | '.join(filter_parts) if filter_parts else 'none'
+
+            lines += [
+                f'',
+                f'{i}. {name_label}',
+                f'   Source: {src_title} ({src_id})',
+                f'   Topics: {topic_str}',
+                f'   → {dst_str} ({dst_id})',
+                f'   Filters: {filter_str}',
+            ]
+
+        await self.bot_client.send_message(event.chat_id, '\n'.join(lines))
 
     def start_background_tasks(self):
         """Start background tasks once. Call from main(), not from register_handlers."""
@@ -407,6 +475,15 @@ class Forwarder:
     async def _run_gap_fill(self):
         total_sent = 0
         for chat_id, rules in self.source_index.items():
+            # On first run for this chat, initialize scan_state to N days ago
+            if get_scan_state(self.db, chat_id) is None:
+                cutoff = datetime.now(tz=timezone.utc) - timedelta(days=self._initial_days)
+                start_id = 0
+                async for msg in self.user_client.iter_messages(chat_id, offset_date=cutoff, limit=1, reverse=True):
+                    start_id = max(0, msg.id - 1)
+                set_scan_state(self.db, chat_id, start_id)
+                logger.info(f'[gap_fill] chat {chat_id}: first run, initialized to last {self._initial_days}d (msg {start_id})')
+
             # Loop in batches of GAP_FILL_BATCH (oldest-first) until fully caught up
             while True:
                 last_id = get_scan_state(self.db, chat_id)
@@ -746,6 +823,7 @@ async def rpc_server(user_client, start_time, socket_path, db=None, forwarder=No
 
 async def main():
     paths.ensure_data_dir()
+    paths.PID_PATH.write_text(str(os.getpid()))
     config = load_config()
     setup_logging(config)
 

@@ -10,7 +10,7 @@ from textual.widgets import Button, Checkbox, Input, Label
 
 from tui.config_io import ensure_rule_uuid, load_config, save_config
 from tui.widgets.chat_picker import ChatPickerModal
-from paths import CONFIG_PATH
+from paths import CONFIG_PATH, DATA_DIR
 
 
 def _chat_label(title: str, chat_id: int | None) -> str:
@@ -267,7 +267,7 @@ class RestartPromptScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "yes-btn":
             try:
-                subprocess.run(self._cmd.split(), check=True)
+                subprocess.Popen(self._cmd, shell=True, cwd=str(DATA_DIR.parent))
                 self.notify("Daemon restarted")
             except Exception as e:
                 self.notify(f"Restart failed: {e}", severity="error")

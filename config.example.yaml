@@ -3,6 +3,13 @@
 # systemd users: systemctl --user restart tele-forwarder
 restart_cmd: docker compose restart forwarder
 
+# owner_id: your Telegram user ID (integer).
+# Used for two things:
+#   1. The bot sends startup/error notifications to this ID.
+#   2. The bot responds to /status and /rules commands only from this ID.
+# Find your ID by messaging @userinfobot or @username_to_id_bot.
+# owner_id: 123456789
+
 sources:
   # --- Example 1: Mirror an entire group (all topics) ---
   - name: "Source Group Alpha"

@@ -71,10 +71,43 @@ data/
 ├── bot.session          # Telethon session for bot
 ├── mappings.db          # SQLite: message_map + scan_state + forward_events (WAL mode)
 ├── forwarder.log        # rotating log (5 MB × 3 files)
+├── daemon.pid           # PID of the running daemon (written at startup)
 └── rpc.sock             # Unix socket for TUI ↔ daemon RPC
 ```
 
 The path root is controlled by `TELE_FORWARDER_DATA_DIR` (default: `./data`) or the `--data-dir` CLI flag (takes precedence). All paths are derived in `paths.py` — never hardcode paths elsewhere.
+
+## Running multiple instances
+
+Each instance needs its own data directory with separate secrets, sessions, config, and DB.
+
+```bash
+mkdir -p data2
+cp data/secrets.yaml data2/          # or write new credentials for a different account
+cp config.example.yaml data2/config.yaml
+# If using a different Telegram account:
+TELE_FORWARDER_DATA_DIR=./data2 uv run python -m tui setup
+# If reusing the same account (just different rules):
+cp data/forwarder.session data2/
+cp data/bot.session data2/
+```
+
+Start the second instance:
+```bash
+TELE_FORWARDER_DATA_DIR=./data2 uv run forwarder.py &
+```
+
+TUI for the second instance:
+```bash
+TELE_FORWARDER_DATA_DIR=./data2 uv run --extra tui python -m tui
+```
+
+**`restart_cmd` for secondary instances** must use the PID file, not `pkill -f "forwarder.py"` — the latter kills ALL instances:
+```yaml
+restart_cmd: "kill $(cat data2/daemon.pid 2>/dev/null) 2>/dev/null; sleep 1 && TELE_FORWARDER_DATA_DIR=./data2 uv run forwarder.py &"
+```
+
+**Do not redirect stdout to the log file** (`>> log 2>&1`). The daemon already has a `RotatingFileHandler` that writes to `forwarder.log`. Redirecting stdout causes every log line to appear twice. Just run with `&` and let the file handler do the work.
 
 > **macOS Docker Desktop**: bind-mounted Unix sockets may not be reachable from the host due to VirtioFS limitations. Run the daemon natively (`uv run forwarder.py`) for local Mac dev; use Docker only on a Linux VPS.
 
@@ -104,13 +137,13 @@ Screen-local bindings (`r` and `d` are intentionally reserved for screen actions
 
 ## After making changes
 
-- **Any change to `forwarder.py`** — always restart the daemon immediately:
+- **Any change to `forwarder.py`** — always restart the daemon immediately. Use the PID file to avoid killing other instances:
   ```bash
-  # Default data dir
-  pkill -f "forwarder.py"; sleep 1 && source $HOME/.local/bin/env && uv run forwarder.py &>> data/forwarder.log &
-
-  # Named instance
-  pkill -f "data/alice"; sleep 1 && uv run forwarder.py --data-dir data/alice &>> data/alice/forwarder.log &
+  kill $(cat data/daemon.pid 2>/dev/null); sleep 1 && uv run forwarder.py &
+  ```
+  For a named instance:
+  ```bash
+  kill $(cat data2/daemon.pid 2>/dev/null); sleep 1 && uv run forwarder.py --data-dir data2 &
   ```
 - **TUI changes** (`tui/`) — no restart needed; just re-launch the TUI.
 
@@ -142,6 +175,9 @@ These were broken in the original code and have been fixed:
 | Telegram General topic (id=1) | Messages in General topic have `reply_to=None` (no thread marker). `get_message_topic()` returns `1` when `reply_to` is None. |
 | Album messages sent individually | Albums share `grouped_id`. When resending manually, group by `grouped_id` first and call `resend_album(messages)`. Never send album members one by one — they arrive as separate unrelated images. Only one message in an album carries the caption; the others have empty `message`. |
 | Daemon + resend script session conflict | Two Telethon processes cannot share the same `.session` file safely. Stop the daemon before running any standalone resend/test script. |
+| Two daemons fighting over session file | Starting a second daemon before the first fully exits (or while `tui setup` still holds the session open) causes `sqlite3.OperationalError: database is locked` and the new process opens the session read-only. Always wait for the previous process to exit before starting a new one. Use `kill $(cat data/daemon.pid)` and confirm the PID is gone before relaunching. |
+| `restart_cmd` with `pkill -f "forwarder.py"` | Kills ALL forwarder instances on the host, not just the one for this data dir. Use `kill $(cat <datadir>/daemon.pid)` instead. The daemon writes its PID to `daemon.pid` at startup. |
+| `subprocess.run(cmd.split())` in TUI restart | The TUI's `RestartPromptScreen` previously used `subprocess.run(cmd.split(), check=True)` which breaks shell operators (`&&`, `;`, `&`, `&>>`). Fixed to `subprocess.Popen(cmd, shell=True, cwd=DATA_DIR.parent)`. The CWD is set to the repo root so relative paths in `restart_cmd` resolve correctly. |
 
 ## Testing
 
@@ -166,6 +202,8 @@ Unit tests for pure logic (config_io, stats) use `tempfile.TemporaryDirectory` w
 **Edit/delete mirroring.** `mappings.db` maps `(source_chat_id, source_msg_id)` → `(dest_chat_id, dest_msg_id)`. On `MessageEdited` / `MessageDeleted` events, the forwarder looks up the destination message and edits/deletes it. Delete events don't always carry `chat_id` — the handler guards against `None`.
 
 **Topic support.** Forum topic thread IDs come from `message.reply_to.reply_to_top_id` (replies within a topic) or `message.reply_to.reply_to_msg_id` (topic starter). `get_message_topic()` in `forwarder.py` handles this. `topics: all` in config bypasses the check entirely.
+
+**Gap-fill on startup.** `gap_filler()` runs 10 seconds after startup, then every `GAP_FILL_INTERVAL` (5 min). It fetches messages with `id > last_scanned_msg_id` from `scan_state` and re-sends anything not in `message_map`. On first run for a chat (no `scan_state` entry), it initializes to the boundary message from `gap_fill_initial_days` ago (default 7) instead of scanning from message #1. This prevents a fresh instance from replaying years of history.
 
 **Source index.** At startup `build_source_index(config)` builds a `chat_id → [rules]` dict. The event handlers are registered with `chats=source_ids` so Telethon only calls them for monitored chats.
 
@@ -195,8 +233,9 @@ Unit tests for pure logic (config_io, stats) use `tempfile.TemporaryDirectory` w
 - `filters.media_types` — empty list = pass all; options: `text photo video audio document gif`
 
 Top-level keys:
-- `restart_cmd` — TUI offers to run this after saving a rule (only if set)
-- `owner_id` — your personal Telegram user ID; daemon DMs you on gap-fill completion and permanent failures
+- `restart_cmd` — TUI offers to run this after saving a rule. Use `kill $(cat <datadir>/daemon.pid)` not `pkill -f forwarder.py` when running multiple instances.
+- `owner_id` — your personal Telegram user ID; daemon DMs you on gap-fill completion and permanent failures; also gates `/status` and `/rules` bot commands.
+- `gap_fill_initial_days` — optional (default `7`); on first run for a chat, gap_fill starts from this many days ago instead of the beginning of chat history.
 
 ## Deployment (systemd — alternative to Docker)
 

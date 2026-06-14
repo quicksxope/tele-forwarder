@@ -10,6 +10,7 @@ LOG_PATH     = DATA_DIR / 'forwarder.log'
 SOCKET_PATH  = DATA_DIR / 'rpc.sock'
 USER_SESSION = DATA_DIR / 'forwarder'  # Telethon appends .session
 BOT_SESSION  = DATA_DIR / 'bot'
+PID_PATH     = DATA_DIR / 'daemon.pid'
 
 
 def ensure_data_dir() -> None:
