@@ -83,9 +83,16 @@ def init_db(path=None):
             source_msg_id  INTEGER NOT NULL,
             dest_chat_id   INTEGER NOT NULL,
             dest_msg_id    INTEGER NOT NULL,
+            dest_topic_id  INTEGER,
             PRIMARY KEY (source_chat_id, source_msg_id)
         )
     ''')
+    # Migrate existing DBs that predate the dest_topic_id column
+    try:
+        conn.execute('ALTER TABLE message_map ADD COLUMN dest_topic_id INTEGER')
+        conn.commit()
+    except Exception:
+        pass  # column already exists
     conn.execute('''
         CREATE TABLE IF NOT EXISTS scan_state (
             chat_id             INTEGER NOT NULL,
@@ -107,10 +114,10 @@ def init_db(path=None):
     return conn
 
 
-def save_mapping(conn, source_chat_id, source_msg_id, dest_chat_id, dest_msg_id):
+def save_mapping(conn, source_chat_id, source_msg_id, dest_chat_id, dest_msg_id, dest_topic_id=None):
     conn.execute(
-        'INSERT OR REPLACE INTO message_map VALUES (?,?,?,?)',
-        (source_chat_id, source_msg_id, dest_chat_id, dest_msg_id),
+        'INSERT OR REPLACE INTO message_map VALUES (?,?,?,?,?)',
+        (source_chat_id, source_msg_id, dest_chat_id, dest_msg_id, dest_topic_id),
     )
     conn.commit()
 
@@ -168,17 +175,28 @@ def get_error_count(conn, source_chat_id, source_msg_id):
 def resolve_reply_to(db, message, dest_topic):
     """Return the reply_to value to use when re-sending a message.
 
-    If the source message replies to a message we already forwarded, point to
-    the forwarded copy. Otherwise fall back to dest_topic (keeps forum thread).
+    If the source message replies to a message we already forwarded AND that
+    forwarded copy is in the same destination topic, point to it (creates a
+    visible reply chain). Otherwise fall back to dest_topic.
+
+    Cross-topic replies in the source (common in forums) must NOT be chained:
+    using a dest_msg_id from a different topic would silently route the new
+    message to that wrong topic instead of the one the rule specifies.
     """
     if not message.reply_to:
         return dest_topic
     reply_msg_id = getattr(message.reply_to, 'reply_to_msg_id', None)
     if not reply_msg_id:
         return dest_topic
-    mapping = get_mapping(db, message.chat_id, reply_msg_id)
-    if mapping:
-        return mapping[1]  # dest_msg_id
+    row = db.execute(
+        'SELECT dest_msg_id, dest_topic_id FROM message_map '
+        'WHERE source_chat_id=? AND source_msg_id=?',
+        (message.chat_id, reply_msg_id),
+    ).fetchone()
+    if row:
+        dest_msg_id, mapped_topic_id = row
+        if mapped_topic_id == dest_topic:
+            return dest_msg_id
     return dest_topic
 
 
@@ -535,7 +553,7 @@ class Forwarder:
                             )
                             dest_id = rule['destination']['chat_id']
                             for src_msg, sent in zip(album_msgs, sent_list):
-                                save_mapping(self.db, src_msg.chat_id, src_msg.id, dest_id, sent.id)
+                                save_mapping(self.db, src_msg.chat_id, src_msg.id, dest_id, sent.id, dest_topic)
                                 record_event(self.db, src_msg.chat_id, src_msg.id, 'ok')
                             total_sent += len(sent_list)
                             logger.info(f'[gap_fill] Album {grouped_id} ({len(sent_list)}) → {dest_id}')
@@ -569,7 +587,7 @@ class Forwarder:
                                 self.user_client, self.bot_client, rule, msg, reply_to=reply_to
                             )
                             dest_id = rule['destination']['chat_id']
-                            save_mapping(self.db, msg.chat_id, msg.id, dest_id, sent.id)
+                            save_mapping(self.db, msg.chat_id, msg.id, dest_id, sent.id, dest_topic)
                             record_event(self.db, msg.chat_id, msg.id, 'ok')
                             total_sent += 1
                             logger.info(f'[gap_fill] Msg {msg.id} → {dest_id}')
@@ -609,7 +627,7 @@ class Forwarder:
                 sent_list = await resend_album(self.user_client, self.bot_client, rule, messages, reply_to=reply_to)
                 dest_id = rule['destination']['chat_id']
                 for src_msg, sent in zip(messages, sent_list):
-                    save_mapping(self.db, src_msg.chat_id, src_msg.id, dest_id, sent.id)
+                    save_mapping(self.db, src_msg.chat_id, src_msg.id, dest_id, sent.id, dest_topic)
                     record_event(self.db, src_msg.chat_id, src_msg.id, 'ok')
                 logger.info(f'Album ({len(sent_list)} msgs) forwarded → {dest_id}')
             except Exception as e:
@@ -647,7 +665,7 @@ class Forwarder:
                     reply_to = resolve_reply_to(self.db, message, dest_topic)
                     sent = await resend_single(self.user_client, self.bot_client, rule, message, reply_to=reply_to)
                     dest_id = rule['destination']['chat_id']
-                    save_mapping(self.db, message.chat_id, message.id, dest_id, sent.id)
+                    save_mapping(self.db, message.chat_id, message.id, dest_id, sent.id, dest_topic)
                     record_event(self.db, message.chat_id, message.id, 'ok')
                     logger.info(f'Forwarded msg {message.id} from {message.chat_id} → {dest_id}')
                 except Exception as e:
