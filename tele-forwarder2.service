@@ -1,0 +1,21 @@
+# Instance 2 — separate data dir (data2/), different Telegram account
+# See CLAUDE.md for multi-instance documentation.
+[Unit]
+Description=Telegram Message Forwarder (instance 2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=devops
+WorkingDirectory=/home/devops/repo/tele-forwarder
+Environment=PATH=/home/devops/repo/tele-forwarder/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TELE_FORWARDER_DATA_DIR=/home/devops/repo/tele-forwarder/data2
+ExecStart=/home/devops/repo/tele-forwarder/.venv/bin/python3 forwarder.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
