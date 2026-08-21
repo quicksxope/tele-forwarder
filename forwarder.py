@@ -344,10 +344,12 @@ class Forwarder:
         # Event handler refs for hot-reload
         self._event_handlers: list[tuple] = []
         self._initial_days: int = int(config.get('gap_fill_initial_days', 7))
+        self._start_time: float = time.monotonic()
         # Gap fill stats
         self._last_gap_fill_time: float | None = None
         self._last_gap_fill_count: int = 0
         self._permanent_failures: int = 0
+        self._gap_fill_lock = asyncio.Lock()
 
     def register_handlers(self):
         # Remove any previously registered handlers (user + bot)
@@ -359,7 +361,7 @@ class Forwarder:
         ev_new  = events.NewMessage(chats=source_ids)
         ev_edit = events.MessageEdited(chats=source_ids)
         ev_del  = events.MessageDeleted(chats=source_ids)
-        ev_cmd  = events.NewMessage(pattern=r'^/(status|rules)(@\w+)?$')
+        ev_cmd  = events.NewMessage(pattern=r'^/(status|rules|sync)(@\w+)?$')
 
         self.user_client.add_event_handler(self.on_new_message,     ev_new)
         self.user_client.add_event_handler(self.on_message_edited,  ev_edit)
@@ -378,28 +380,71 @@ class Forwarder:
         if owner_id and event.sender_id != int(owner_id):
             return
 
+        cmd = event.pattern_match.group(1)
+        if cmd == 'status':
+            await self._cmd_status(event)
+        elif cmd == 'rules':
+            await self._cmd_rules(event)
+        elif cmd == 'sync':
+            await self._cmd_sync(event)
+
+    async def _cmd_status(self, event):
+        from datetime import datetime
         me = await self.user_client.get_me()
         name = ' '.join(filter(None, [me.first_name, me.last_name]))
         phone = f'+{me.phone}' if me.phone else 'unknown'
 
+        uptime_s = int(time.monotonic() - self._start_time)
+        h, rem = divmod(uptime_s, 3600)
+        m, s = divmod(rem, 60)
+        uptime_str = f'{h}h {m}m {s}s'
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        forwarded_today = self.db.execute(
+            "SELECT COUNT(*) FROM forward_events WHERE status='ok' AND ts >= ?", (today,)
+        ).fetchone()[0]
+        total_forwarded = self.db.execute(
+            "SELECT COUNT(*) FROM forward_events WHERE status='ok'"
+        ).fetchone()[0]
+
+        if self._last_gap_fill_time is not None:
+            ago_s = int(time.monotonic() - self._last_gap_fill_time)
+            ago_m, ago_s2 = divmod(ago_s, 60)
+            sync_str = f'{ago_m}m {ago_s2}s ago'
+            if self._last_gap_fill_count:
+                sync_str += f' ({self._last_gap_fill_count} synced)'
+        else:
+            sync_str = 'not yet run'
+
         lines = [
             f'🤖 Forwarder — {paths.DATA_DIR}',
             f'',
-            f'👤 Account: {name} ({phone})',
+            f'👤 {name} ({phone})',
+            f'⏱ Uptime: {uptime_str}',
             f'',
+            f'📨 Forwarded today: {forwarded_today}',
+            f'📦 Total forwarded: {total_forwarded}',
+            f'⚠️ Permanent failures: {self._permanent_failures}',
+            f'',
+            f'🔄 Last sync: {sync_str}',
+            f'📋 Rules: {len(self.config.get("sources", []))} active',
+            f'',
+            f'Send /rules to list rules, /sync to force a gap fill.',
         ]
+        await self.bot_client.send_message(event.chat_id, '\n'.join(lines))
 
+    async def _cmd_rules(self, event):
         rules = self.config.get('sources', [])
-        lines.append(f'📋 Active Rules ({len(rules)}):')
+        lines = [f'📋 Active Rules ({len(rules)}):']
 
         for i, rule in enumerate(rules, 1):
-            src_id  = rule.get('chat_id', '?')
-            dst     = rule.get('destination', {})
-            dst_id  = dst.get('chat_id', '?')
+            src_id    = rule.get('chat_id', '?')
+            dst       = rule.get('destination', {})
+            dst_id    = dst.get('chat_id', '?')
             dst_topic = dst.get('topic_id')
-            topics  = rule.get('topics', 'all')
-            kw      = rule.get('filters', {}).get('keywords', [])
-            mt      = rule.get('filters', {}).get('media_types', [])
+            topics    = rule.get('topics', 'all')
+            kw        = rule.get('filters', {}).get('keywords', [])
+            mt        = rule.get('filters', {}).get('media_types', [])
             name_label = rule.get('name', f'Rule {i}')
 
             try:
@@ -415,7 +460,7 @@ class Forwarder:
                 dst_title = str(dst_id)
 
             topic_str = 'all' if topics == 'all' else ', '.join(str(t) for t in topics)
-            dst_str = f'{dst_title}'
+            dst_str = dst_title
             if dst_topic:
                 dst_str += f' › topic {dst_topic}'
             filter_parts = []
@@ -435,6 +480,26 @@ class Forwarder:
             ]
 
         await self.bot_client.send_message(event.chat_id, '\n'.join(lines))
+
+    async def _cmd_sync(self, event):
+        if self._gap_fill_lock.locked():
+            await self.bot_client.send_message(event.chat_id, '⏳ Sync already in progress.')
+            return
+
+        status_msg = await self.bot_client.send_message(event.chat_id, '🔄 Syncing gaps...')
+        try:
+            async with self._gap_fill_lock:
+                synced = await self._run_gap_fill()
+        except Exception as e:
+            await self.bot_client.edit_message(event.chat_id, status_msg.id, text=f'❌ Sync failed: {e}')
+            logger.error(f'[sync cmd] {e}')
+            return
+
+        if synced:
+            text = f'✅ Sync complete — {synced} message(s) forwarded.'
+        else:
+            text = '✅ Sync complete — nothing to forward.'
+        await self.bot_client.edit_message(event.chat_id, status_msg.id, text=text)
 
     def start_background_tasks(self):
         """Start background tasks once. Call from main(), not from register_handlers."""
@@ -488,10 +553,12 @@ class Forwarder:
         """
         await asyncio.sleep(10)  # let clients fully connect first
         while True:
-            try:
-                await self._run_gap_fill()
-            except Exception as e:
-                logger.error(f'[gap_fill] Scan error: {e}')
+            if not self._gap_fill_lock.locked():
+                try:
+                    async with self._gap_fill_lock:
+                        await self._run_gap_fill()
+                except Exception as e:
+                    logger.error(f'[gap_fill] Scan error: {e}')
             await asyncio.sleep(GAP_FILL_INTERVAL)
 
     async def _run_gap_fill(self):
@@ -609,6 +676,7 @@ class Forwarder:
             self._last_gap_fill_time = time.monotonic()
             self._last_gap_fill_count = total_sent
             await self.notify_owner(f'📩 Gap fill: synced {total_sent} missed message(s).')
+        return total_sent
 
     async def _flush_album(self, grouped_id: int):
         await asyncio.sleep(ALBUM_FLUSH_DELAY)
