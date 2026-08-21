@@ -212,12 +212,16 @@ def get_message_topic(message):
     """Return topic thread ID for messages inside a forum topic, else None.
 
     In Telegram forums, the General topic (id=1) never sets reply_to on its
-    messages. All other topics set reply_to_top_id (for replies) or
-    reply_to_msg_id (for top-level posts within the topic).
+    top-level messages. Named topics always set reply_to_top_id to their topic
+    ID, even for replies. General-topic replies have reply_to set but
+    reply_to_top_id=None — treat those as topic 1 as well.
     """
     if not message.reply_to:
-        return 1  # No reply_to → General topic
-    return message.reply_to.reply_to_top_id or message.reply_to.reply_to_msg_id
+        return 1  # General topic, top-level post
+    top = message.reply_to.reply_to_top_id
+    if top is None:
+        return 1  # reply within General topic — no top_id means not a named topic
+    return top
 
 
 def get_media_type(message):
