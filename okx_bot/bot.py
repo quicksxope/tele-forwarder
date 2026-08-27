@@ -10,7 +10,8 @@ from pathlib import Path
 import yaml
 from telethon import TelegramClient, events
 
-from .parser import Signal, parse_signal
+from .channels import get_active_channel
+from .parser import Signal
 from .trader import OkxTrader
 
 logging.basicConfig(
@@ -41,7 +42,7 @@ def _cfg() -> dict:
     env.update(_load_env_file(ROOT / ".env"))
     env.update(_load_env_file(DATA / "okx_bot.env"))
     for k, v in os.environ.items():
-        if k.startswith(("OKX_", "TELEGRAM_", "SIGNAL_", "NOTIF_", "TRADE_")):
+        if k.startswith(("OKX_", "TELEGRAM_", "SIGNAL_", "NOTIF_", "TRADE_", "ACTIVE_")):
             env[k] = v
     return env
 
@@ -126,8 +127,11 @@ async def main() -> None:
         api_hash = api_hash or secrets.get("api_hash", "")
         bot_token = bot_token or secrets.get("bot_token", "")
 
-    signal_chat = int(cfg.get("SIGNAL_CHAT_ID", "-1002290536326"))
+    channel = get_active_channel(cfg)
+    signal_chat = channel.chat_id
     notif_chat = int(cfg.get("NOTIF_CHAT_ID", "6878724303"))
+    logger.info("Active channel: %s (%s) parser=%s chat_id=%s",
+                channel.key, channel.name, channel.parser, channel.chat_id)
 
     required_okx = ["OKX_API_KEY", "OKX_SECRET", "OKX_PASSWORD"]
     missing = [k for k in required_okx if not cfg.get(k)]
@@ -169,7 +173,7 @@ async def main() -> None:
     @client.on(events.NewMessage(chats=signal_chat))
     async def on_signal(event: events.NewMessage.Event) -> None:
         text = event.raw_text or ""
-        signal = parse_signal(text)
+        signal = channel.parse(text)
         if not signal:
             logger.debug("No signal parsed from msg %s", event.id)
             return

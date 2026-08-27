@@ -1,0 +1,28 @@
+# Switch signal channel by changing `active` (or set ACTIVE_CHANNEL in .env).
+#
+# parser values (built-in):
+#   dex_vip      — DEX VIP format (Position/Entry Price/TP/SL/Timeframe WIB)
+#   okx_confirm  — legacy "Sinyal diterima / Order berhasil" format
+#
+# Same parser can be reused by multiple channels if the text layout matches.
+
+active: dex_vip
+
+channels:
+  dex_vip:
+    name: "DEX VIP | Bitcoin & Crypto"
+    chat_id: -1002290536326
+    parser: dex_vip
+    enabled: true
+
+  # Example: another channel with the same text format — only change chat_id
+  # dex_vip_backup:
+  #   name: "DEX VIP backup"
+  #   chat_id: -1001111111111
+  #   parser: dex_vip
+
+  # Example: legacy bot notification channel
+  # sinyaldex_bot:
+  #   name: "okx_trading_bot_sinyaldex"
+  #   chat_id: -1002222222222
+  #   parser: okx_confirm

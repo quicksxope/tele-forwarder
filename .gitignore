@@ -5,6 +5,7 @@ __pycache__/
 **/__pycache__/
 .env
 okx_bot/.env
+okx_bot/channels.yaml
 *.db
 
 # Legacy locations (pre data-dir migration)

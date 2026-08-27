@@ -27,7 +27,7 @@ Timeframe: 15:07-19:07 WIB
 
 
 def test_legacy_confirm_block():
-    s = parse_signal(SAMPLE)
+    s = parse_signal(SAMPLE, parser="okx_confirm")
     assert s is not None
     assert s.pair == "ETH/USDT"
     assert s.side == "buy"
@@ -35,7 +35,7 @@ def test_legacy_confirm_block():
 
 
 def test_dex_vip_format():
-    s = parse_signal(DEX)
+    s = parse_signal(DEX, parser="dex_vip")
     assert s is not None
     assert s.pair == "GTC/USDT"
     assert s.side == "buy"
