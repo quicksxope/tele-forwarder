@@ -18,6 +18,15 @@ Self-hosted Telegram message forwarder. Monitors private groups/channels you're 
 8. [Running multiple instances](#running-multiple-instances)
 9. [Managing rules with the TUI](#managing-rules-with-the-tui)
 10. [Troubleshooting](#troubleshooting)
+11. [OKX signal bot](#okx-signal-bot)
+
+---
+
+## OKX signal bot
+
+Optional module under [`okx_bot/`](okx_bot/) — parse DEX VIP-style Telegram signals, trade on OKX via CCXT (demo/live), backtest, and weekly win rate / ROI / avg R reports.
+
+See **[okx_bot/README.md](okx_bot/README.md)** for setup and commands.
 
 ---
 

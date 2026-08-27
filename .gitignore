@@ -2,7 +2,10 @@ data/
 .venv/
 venv/
 __pycache__/
+**/__pycache__/
 .env
+okx_bot/.env
+*.db
 
 # Legacy locations (pre data-dir migration)
 config.yaml

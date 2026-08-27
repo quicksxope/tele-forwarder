@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Resend recent messages from specific topics, grouping albums correctly.
+Resend recent messages from source chat, grouping albums correctly.
 Usage: uv run python resend_recent.py
 """
 import asyncio
@@ -12,16 +12,10 @@ from collections import defaultdict
 
 import paths
 
-SOURCE_CHAT = -1002745218627
+SOURCE_CHAT = -1002290536326
+DEST_CHAT = 6878724303
 
-# topic_id -> dest rule info
-RULES = [
-    {'topics': [1],    'dest_chat': -1003751705288, 'dest_topic': 35},
-    {'topics': [2117], 'dest_chat': -1003751705288, 'dest_topic': 36},
-    {'topics': [3, 6063], 'dest_chat': -1003751705288, 'dest_topic': 2},
-]
-
-FETCH_LIMIT = 30  # messages per topic to look back
+FETCH_LIMIT = 30  # recent messages to look back
 
 
 def get_mapping(conn, source_chat_id, source_msg_id):
@@ -56,7 +50,7 @@ async def download(user_client, message):
     return path
 
 
-async def send_album(bot_client, messages, user_client, dest_chat, dest_topic):
+async def send_album(bot_client, messages, user_client, dest_chat):
     paths_list = [await download(user_client, m) for m in messages]
     try:
         caption_msg = next((m for m in messages if m.message), None)
@@ -67,7 +61,6 @@ async def send_album(bot_client, messages, user_client, dest_chat, dest_topic):
             file=paths_list,
             caption=caption,
             formatting_entities=caption_entities,
-            reply_to=dest_topic,
         )
         return sent if isinstance(sent, list) else [sent]
     finally:
@@ -75,7 +68,7 @@ async def send_album(bot_client, messages, user_client, dest_chat, dest_topic):
             os.unlink(p)
 
 
-async def send_single(bot_client, message, user_client, dest_chat, dest_topic):
+async def send_single(bot_client, message, user_client, dest_chat):
     if message.media:
         path = await download(user_client, message)
         try:
@@ -84,7 +77,6 @@ async def send_single(bot_client, message, user_client, dest_chat, dest_topic):
                 file=path,
                 caption=message.message or '',
                 formatting_entities=message.entities or [],
-                reply_to=dest_topic,
             )
         finally:
             os.unlink(path)
@@ -93,7 +85,6 @@ async def send_single(bot_client, message, user_client, dest_chat, dest_topic):
             entity=dest_chat,
             message=message.message or '',
             formatting_entities=message.entities or [],
-            reply_to=dest_topic,
         )
     return sent
 
@@ -113,63 +104,53 @@ async def main():
     await bot_client.start(bot_token=secrets['bot_token'])
     print("Clients connected")
 
-    for rule in RULES:
-        for topic_id in rule['topics']:
-            dest_chat = rule['dest_chat']
-            dest_topic = rule['dest_topic']
+    print(f"\n--- {SOURCE_CHAT} → {DEST_CHAT} (no topics) ---")
 
-            print(f"\n--- Topic {topic_id} → dest_topic {dest_topic} ---")
+    msgs = []
+    async for msg in user_client.iter_messages(SOURCE_CHAT, limit=FETCH_LIMIT):
+        msgs.append(msg)
 
-            # Fetch recent messages from this topic
-            msgs = []
-            async for msg in user_client.iter_messages(
-                SOURCE_CHAT,
-                limit=FETCH_LIMIT,
-                reply_to=topic_id,
-            ):
-                msgs.append(msg)
+    msgs.reverse()  # oldest first
+    print(f"  Fetched {len(msgs)} messages")
 
-            msgs.reverse()  # oldest first
-            print(f"  Fetched {len(msgs)} messages")
+    # Group by grouped_id, preserving order
+    already_sent = 0
+    albums: dict[int, list] = defaultdict(list)
+    singles = []
+    for msg in msgs:
+        if get_mapping(db, SOURCE_CHAT, msg.id):
+            already_sent += 1
+            continue
+        if msg.grouped_id:
+            albums[msg.grouped_id].append(msg)
+        else:
+            singles.append(msg)
 
-            # Group by grouped_id, preserving order
-            already_sent = 0
-            albums: dict[int, list] = defaultdict(list)
-            singles = []
-            for msg in msgs:
-                if get_mapping(db, SOURCE_CHAT, msg.id):
-                    already_sent += 1
-                    continue
-                if msg.grouped_id:
-                    albums[msg.grouped_id].append(msg)
-                else:
-                    singles.append(msg)
+    print(f"  Already forwarded: {already_sent}")
+    print(f"  Albums to send: {len(albums)} groups")
+    print(f"  Singles to send: {len(singles)}")
 
-            print(f"  Already forwarded: {already_sent}")
-            print(f"  Albums to send: {len(albums)} groups")
-            print(f"  Singles to send: {len(singles)}")
+    for grouped_id, album_msgs in albums.items():
+        # Sort album by message id (ascending)
+        album_msgs.sort(key=lambda m: m.id)
+        ids = [m.id for m in album_msgs]
+        print(f"  Sending album {grouped_id}: msg ids {ids}")
+        try:
+            sent_list = await send_album(bot_client, album_msgs, user_client, DEST_CHAT)
+            for src_msg, sent in zip(album_msgs, sent_list):
+                save_mapping(db, SOURCE_CHAT, src_msg.id, DEST_CHAT, sent.id)
+            print(f"    → Sent as album ({len(sent_list)} msgs)")
+        except Exception as e:
+            print(f"    ERROR: {e}")
 
-            for grouped_id, album_msgs in albums.items():
-                # Sort album by message id (ascending)
-                album_msgs.sort(key=lambda m: m.id)
-                ids = [m.id for m in album_msgs]
-                print(f"  Sending album {grouped_id}: msg ids {ids}")
-                try:
-                    sent_list = await send_album(bot_client, album_msgs, user_client, dest_chat, dest_topic)
-                    for src_msg, sent in zip(album_msgs, sent_list):
-                        save_mapping(db, SOURCE_CHAT, src_msg.id, dest_chat, sent.id)
-                    print(f"    → Sent as album ({len(sent_list)} msgs)")
-                except Exception as e:
-                    print(f"    ERROR: {e}")
-
-            for msg in singles:
-                print(f"  Sending single msg {msg.id}")
-                try:
-                    sent = await send_single(bot_client, msg, user_client, dest_chat, dest_topic)
-                    save_mapping(db, SOURCE_CHAT, msg.id, dest_chat, sent.id)
-                    print(f"    → Sent (dest msg {sent.id})")
-                except Exception as e:
-                    print(f"    ERROR: {e}")
+    for msg in singles:
+        print(f"  Sending single msg {msg.id}")
+        try:
+            sent = await send_single(bot_client, msg, user_client, DEST_CHAT)
+            save_mapping(db, SOURCE_CHAT, msg.id, DEST_CHAT, sent.id)
+            print(f"    → Sent (dest msg {sent.id})")
+        except Exception as e:
+            print(f"    ERROR: {e}")
 
     print("\nDone.")
     await user_client.disconnect()
