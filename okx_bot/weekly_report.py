@@ -12,6 +12,7 @@ import yaml
 from telethon import TelegramClient
 
 from .metrics import compute_metrics
+from .supabase_store import make_store
 from .trade_store import TradeStore
 
 logger = logging.getLogger("okx_bot.weekly")
@@ -32,7 +33,7 @@ def _load_env() -> dict[str, str]:
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
     for k, v in os.environ.items():
-        if k.startswith(("OKX_", "TELEGRAM_", "NOTIF_", "REPORT_")):
+        if k.startswith(("OKX_", "TELEGRAM_", "NOTIF_", "REPORT_", "SUPABASE_", "DATABASE_")):
             env[k] = v
     return env
 
@@ -103,7 +104,12 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = _load_env()
-    store = TradeStore(Path(args.db))
+    if (cfg.get("DATABASE_URL") and "[YOUR-PASSWORD]" not in cfg.get("DATABASE_URL", "")) or (
+        cfg.get("SUPABASE_URL") and cfg.get("SUPABASE_SERVICE_ROLE_KEY")
+    ):
+        store = make_store(cfg, DATA)
+    else:
+        store = TradeStore(Path(args.db))
     text = build_weekly_metrics(store, weeks=args.weeks, source=args.source)
     print(text)
     if args.send:

@@ -1,6 +1,6 @@
 # OKX Signal Bot
 
-Parse Telegram signal channels and trade on **OKX** via [CCXT](https://github.com/ccxt/ccxt).  
+Parse Telegram signal channels and trade on **OKX** or **Bybit** via [CCXT](https://github.com/ccxt/ccxt).  
 Includes backtest, period metrics (win rate / ROI / avg R), and weekly Telegram reports.
 
 ## Layout
@@ -54,6 +54,23 @@ ACTIVE_CHANNEL=other_vip
 
 Built-in parsers: `dex_vip`, `okx_confirm`.
 
+## Exchange (OKX or Bybit)
+
+Set in `.env`:
+
+```bash
+EXCHANGE=bybit          # default: okx
+BYBIT_API_KEY=...
+BYBIT_SECRET=...
+BYBIT_SANDBOX=true      # testnet — separate API keys from mainnet
+```
+
+Parser stays `dex_vip` — only the execution venue changes. Test connection:
+
+```bash
+PYTHONPATH=. uv run python okx_bot/scripts/test_bybit_order.py
+```
+
 ## Setup
 
 ```bash
@@ -79,6 +96,22 @@ PYTHONPATH=. uv run python okx_bot/tests/test_metrics.py
 - **Win rate** — profitable closed trades ÷ decisive trades  
 - **ROI** — equity change over the period  
 - **Avg R** — mean R-multiple vs stop distance  
+
+## Supabase
+
+1. Run `okx_bot/supabase/schema.sql` in SQL Editor (once).
+2. Add to `okx_bot/.env` (pick one):
+
+```bash
+# Preferred — Database connection string (URI)
+DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@db.xxxx.supabase.co:5432/postgres
+
+# Or REST
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=eyJ...
+```
+
+Bot + weekly report then use Postgres/Supabase. Without these → local SQLite.
 
 ## Safety
 
