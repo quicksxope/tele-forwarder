@@ -2,6 +2,7 @@ data/
 .venv/
 venv/
 __pycache__/
+**/__pycache__/
 *.pyc
 *.session
 *.session-journal
@@ -11,5 +12,11 @@ __pycache__/
 CLAUDE.md
 tui/
 tele-forwarder.service
+tele-forwarder2.service
 README*
 .claude/
+.env
+okx_bot/.env
+okx_bot/channels.yaml
+okx_bot/docs/
+.github/

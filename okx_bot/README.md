@@ -87,9 +87,19 @@ PYTHONPATH=. uv run python -m okx_bot
 PYTHONPATH=. uv run python okx_bot/scripts/run_backtest.py
 PYTHONPATH=. uv run python -m okx_bot.weekly_report --source backtest
 PYTHONPATH=. uv run python -m okx_bot.weekly_report --source live --send
-PYTHONPATH=. uv run python okx_bot/tests/test_parser.py
-PYTHONPATH=. uv run python okx_bot/tests/test_metrics.py
+uv run pytest okx_bot/tests -q
 ```
+
+### Docker (with forwarder)
+
+From the repo root (after `okx_bot/.env` + `okx_bot/channels.yaml` exist):
+
+```bash
+docker compose up -d --build okx_bot
+docker compose logs -f okx_bot
+```
+
+Production deploy to GCP: see **[DEPLOY.md](../DEPLOY.md)**.
 
 ## Weekly metrics
 

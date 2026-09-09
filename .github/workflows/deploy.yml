@@ -1,0 +1,51 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-gcp
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync deps
+        run: uv sync --extra dev --frozen
+
+      - name: Run okx_bot tests
+        run: uv run pytest okx_bot/tests -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.GCP_HOST }}
+          username: ${{ secrets.GCP_USER }}
+          key: ${{ secrets.GCP_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.GCP_APP_DIR }}"
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+            # Compose reads UID/GID from .env (bash UID is readonly — do not export it).
+            if [ ! -f .env ]; then
+              printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)" > .env
+            fi
+            docker compose up -d --build
+            docker compose ps

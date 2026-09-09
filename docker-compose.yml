@@ -1,6 +1,8 @@
 services:
   forwarder:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: tele-forwarder
     restart: unless-stopped
     # Run as the host user so files in ./data/ are owned by you, not root.
@@ -11,3 +13,21 @@ services:
       - ./data:/data
     environment:
       TELE_FORWARDER_DATA_DIR: /data
+
+  okx_bot:
+    build:
+      context: .
+      dockerfile: okx_bot/Dockerfile
+    container_name: okx-signal-bot
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - path: ./okx_bot/.env
+        required: false
+    volumes:
+      - ./data:/data
+      # Create the file on the host before first up (compose will mkdir if missing).
+      - ./okx_bot/channels.yaml:/app/okx_bot/channels.yaml:ro
+    environment:
+      TELE_FORWARDER_DATA_DIR: /data
+      PYTHONPATH: /app

@@ -19,6 +19,7 @@ Self-hosted Telegram message forwarder. Monitors private groups/channels you're 
 9. [Managing rules with the TUI](#managing-rules-with-the-tui)
 10. [Troubleshooting](#troubleshooting)
 11. [OKX signal bot](#okx-signal-bot)
+12. [Deploy to GCP](#deploy-to-gcp)
 
 ---
 
@@ -27,6 +28,12 @@ Self-hosted Telegram message forwarder. Monitors private groups/channels you're 
 Optional module under [`okx_bot/`](okx_bot/) — parse DEX VIP-style Telegram signals, trade on OKX via CCXT (demo/live), backtest, and weekly win rate / ROI / avg R reports.
 
 See **[okx_bot/README.md](okx_bot/README.md)** for setup and commands.
+
+## Deploy to GCP
+
+Production path: **Mac → GitHub (`main`) → GCP VM** via Docker Compose (`forwarder` + `okx_bot`) and GitHub Actions SSH deploy.
+
+Full bootstrap, secrets, and troubleshooting: **[DEPLOY.md](DEPLOY.md)**.
 
 ---
 
@@ -292,18 +299,27 @@ Run the setup wizard once on the host (not inside Docker — there's no TTY insi
 uv run python -m tui setup   # seeds data/ with sessions + secrets.yaml
 ```
 
-Then start the container:
+Seed okx_bot config (file must exist before compose mounts it):
+
+```bash
+cp okx_bot/.env.example okx_bot/.env
+cp okx_bot/channels.example.yaml okx_bot/channels.yaml
+# edit keys + channels; create data/okx_user.session via login_user.py
+```
+
+Then start both services:
 
 ```bash
 # Store your UID/GID in .env so files in ./data/ are owned by you
 echo "UID=$(id -u)" >> .env
 echo "GID=$(id -g)" >> .env
 
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f forwarder
+docker compose logs -f okx_bot
 ```
 
-The daemon auto-restarts on crash or reboot (`restart: unless-stopped`).
+Both daemons auto-restart on crash or reboot (`restart: unless-stopped`). For Mac → GitHub → GCP CI/CD, see [DEPLOY.md](DEPLOY.md).
 
 ---
 
