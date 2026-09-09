@@ -205,6 +205,81 @@ class SupabaseStore:
         except Exception:
             logger.exception("Failed to log signal_event")
 
+    # ------------------------------------------------------------------
+    # user_credentials — per-user exchange API key storage
+    # ------------------------------------------------------------------
+
+    def save_credentials(
+        self,
+        telegram_id: int,
+        exchange: str,
+        *,
+        api_key_enc: str,
+        secret_enc: str,
+        extra_enc: str | None = None,
+        sandbox: bool = False,
+        demo: bool = False,
+    ) -> None:
+        """Upsert encrypted API credentials for a Telegram user."""
+        body = {
+            "telegram_id": telegram_id,
+            "exchange": exchange,
+            "api_key_enc": api_key_enc,
+            "secret_enc": secret_enc,
+            "extra_enc": extra_enc,
+            "sandbox": sandbox,
+            "demo": demo,
+        }
+        self._request(
+            "POST",
+            "user_credentials",
+            body=body,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    def load_credentials(self, telegram_id: int, exchange: str) -> dict | None:
+        """Return the raw (encrypted) credential row, or None if not found."""
+        rows = self._request(
+            "GET",
+            "user_credentials",
+            query={
+                "select": "*",
+                "telegram_id": f"eq.{telegram_id}",
+                "exchange": f"eq.{exchange}",
+                "limit": "1",
+            },
+        ) or []
+        return rows[0] if rows else None
+
+    def list_credentials(self, telegram_id: int) -> list[dict]:
+        """Return all credential rows for a user (without key values)."""
+        rows = self._request(
+            "GET",
+            "user_credentials",
+            query={
+                "select": "exchange,sandbox,demo,created_at,updated_at",
+                "telegram_id": f"eq.{telegram_id}",
+                "order": "exchange.asc",
+            },
+        ) or []
+        return rows
+
+    def delete_credentials(self, telegram_id: int, exchange: str) -> bool:
+        """Delete credentials for a user+exchange. Returns True if a row was deleted."""
+        existing = self.load_credentials(telegram_id, exchange)
+        if not existing:
+            return False
+        self._request(
+            "DELETE",
+            "user_credentials",
+            query={
+                "telegram_id": f"eq.{telegram_id}",
+                "exchange": f"eq.{exchange}",
+            },
+            prefer="return=minimal",
+        )
+        return True
+
     def trades_between(
         self,
         start: datetime,
@@ -264,6 +339,18 @@ class SupabaseStore:
         if not rows:
             return None
         return float(rows[0]["equity"])
+
+    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+        query: dict[str, str] = {
+            "select": "*",
+            "status": "eq.open",
+            "order": "opened_at.desc",
+            "limit": str(limit),
+        }
+        if source:
+            query["source"] = f"eq.{source}"
+        rows = self._request("GET", "trades", query=query) or []
+        return [self._row(r) for r in rows]
 
     @staticmethod
     def _row(r: dict[str, Any]) -> TradeRow:
@@ -432,6 +519,66 @@ class PostgresStore:
         except Exception:
             logger.exception("Failed to log signal_event")
 
+    # ------------------------------------------------------------------
+    # user_credentials — per-user exchange API key storage
+    # ------------------------------------------------------------------
+
+    def save_credentials(
+        self,
+        telegram_id: int,
+        exchange: str,
+        *,
+        api_key_enc: str,
+        secret_enc: str,
+        extra_enc: str | None = None,
+        sandbox: bool = False,
+        demo: bool = False,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_credentials
+                  (telegram_id, exchange, api_key_enc, secret_enc, extra_enc, sandbox, demo)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (telegram_id, exchange) DO UPDATE
+                  SET api_key_enc=%s, secret_enc=%s, extra_enc=%s,
+                      sandbox=%s, demo=%s, updated_at=now()
+                """,
+                (
+                    telegram_id, exchange, api_key_enc, secret_enc, extra_enc, sandbox, demo,
+                    api_key_enc, secret_enc, extra_enc, sandbox, demo,
+                ),
+            )
+            conn.commit()
+
+    def load_credentials(self, telegram_id: int, exchange: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM user_credentials WHERE telegram_id=%s AND exchange=%s",
+                (telegram_id, exchange),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_credentials(self, telegram_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT exchange, sandbox, demo, created_at, updated_at
+                FROM user_credentials WHERE telegram_id=%s ORDER BY exchange
+                """,
+                (telegram_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_credentials(self, telegram_id: int, exchange: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM user_credentials WHERE telegram_id=%s AND exchange=%s",
+                (telegram_id, exchange),
+            )
+            conn.commit()
+        return (cur.rowcount or 0) > 0
+
     def trades_between(
         self,
         start: datetime,
@@ -470,6 +617,18 @@ class PostgresStore:
                 (source, ts.astimezone(timezone.utc)),
             ).fetchone()
         return float(row["equity"]) if row else None
+
+    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+        q = "SELECT * FROM trades WHERE status='open'"
+        params: list[Any] = []
+        if source:
+            q += " AND source=%s"
+            params.append(source)
+        q += " ORDER BY opened_at DESC LIMIT %s"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(q, params).fetchall()
+        return [self._row(r) for r in rows]
 
     @staticmethod
     def _row(r: dict[str, Any]) -> TradeRow:

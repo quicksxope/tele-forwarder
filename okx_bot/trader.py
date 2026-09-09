@@ -211,6 +211,49 @@ class OkxTrader:
         self.exchange.load_markets()
         return self.exchange.fetch_order(order_id, symbol)
 
+    def fetch_open_positions(self) -> list[dict[str, Any]]:
+        """Return non-zero OKX swap positions (normalized)."""
+        self.exchange.load_markets()
+        raw = self.exchange.fetch_positions()
+        out: list[dict[str, Any]] = []
+        for p in raw or []:
+            try:
+                contracts = float(p.get("contracts") or 0)
+            except (TypeError, ValueError):
+                contracts = 0.0
+            if abs(contracts) < 1e-12:
+                # some venues use 'contractSize' / info; also check notional
+                try:
+                    notional = float(p.get("notional") or 0)
+                except (TypeError, ValueError):
+                    notional = 0.0
+                if abs(notional) < 1e-12:
+                    continue
+            side = (p.get("side") or "").lower() or "net"
+            entry = p.get("entryPrice")
+            mark = p.get("markPrice")
+            upnl = p.get("unrealizedPnl")
+            lev = p.get("leverage")
+            symbol = p.get("symbol") or "?"
+            out.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "contracts": contracts,
+                    "entry": float(entry) if entry is not None else None,
+                    "mark": float(mark) if mark is not None else None,
+                    "unrealized_pnl": float(upnl) if upnl is not None else None,
+                    "leverage": float(lev) if lev is not None else None,
+                    "notional": float(p["notional"]) if p.get("notional") is not None else None,
+                    "liquidation": (
+                        float(p["liquidationPrice"])
+                        if p.get("liquidationPrice") is not None
+                        else None
+                    ),
+                }
+            )
+        return out
+
 
 class BybitTrader:
     exchange_name = "bybit"

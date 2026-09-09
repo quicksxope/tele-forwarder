@@ -185,6 +185,18 @@ class TradeStore:
             ).fetchone()
         return float(row["equity"]) if row else None
 
+    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+        q = "SELECT * FROM trades WHERE status='open'"
+        params: list[Any] = []
+        if source:
+            q += " AND source=?"
+            params.append(source)
+        q += " ORDER BY opened_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(q, params).fetchall()
+        return [self._row(r) for r in rows]
+
     @staticmethod
     def _row(r: sqlite3.Row) -> TradeRow:
         return TradeRow(

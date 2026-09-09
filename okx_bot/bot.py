@@ -11,10 +11,12 @@ from pathlib import Path
 import yaml
 from telethon import TelegramClient, events
 
-from .channels import get_active_channel
+from .channels import get_active_channel, list_enabled_channels, match_channel
+from .crypto import decrypt, encrypt
 from .parser import Signal
+from .settings_menu import register_settings_menu
 from .supabase_store import make_store
-from .trader import Trader, make_trader, required_credentials
+from .trader import OkxTrader, BybitTrader, Trader, make_trader, required_credentials
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +28,20 @@ ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("TELE_FORWARDER_DATA_DIR", ROOT.parent / "data")).resolve()
 
 RESTART_DELAY_S = int(os.environ.get("OKX_BOT_RESTART_DELAY", "15"))
+
+
+def _message_topic_id(message) -> int | None:
+    """Forum topic id. Named topics use reply_to_top_id or reply_to_msg_id."""
+    rt = getattr(message, "reply_to", None)
+    if rt is None:
+        return 1
+    top = getattr(rt, "reply_to_top_id", None)
+    if top:
+        return int(top)
+    mid = getattr(rt, "reply_to_msg_id", None)
+    if mid:
+        return int(mid)
+    return 1
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -179,24 +195,6 @@ async def _cancel_when_window_ends(
             pass
 
 
-async def _cmd_start(
-    event, *, channel, signal_chat: int, dry_run: bool, sandbox: bool, exchange: str
-) -> None:
-    mode = "dry-run" if dry_run else "live"
-    venue = "sandbox/testnet" if sandbox else "production"
-    await event.reply(
-        f"🤖 {exchange.upper()} Signal Bot aktif\n\n"
-        f"Channel: {channel.name}\n"
-        f"Parser: {channel.parser}\n"
-        f"Watch: {signal_chat}\n"
-        f"Exchange: {exchange}\n"
-        f"Trading: {mode} ({venue})\n\n"
-        "Commands:\n"
-        "/start — pesan ini\n"
-        "/status — cek status bot"
-    )
-
-
 async def _cmd_status(
     event,
     *,
@@ -232,6 +230,61 @@ async def _cmd_status(
     )
 
 
+def _load_user_trader(store, telegram_id: int, cfg: dict) -> Trader | None:
+    """Load and decrypt per-user credentials from DB, return a Trader or None."""
+    if cfg.get("PREFER_DB_CREDENTIALS", "true").lower() not in ("1", "true", "yes"):
+        return None
+    exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
+    dry_run = cfg.get("TRADE_DRY_RUN", "true").lower() in ("1", "true", "yes")
+    common = {
+        "margin_mode": cfg.get("TRADE_MARGIN_MODE", "cross"),
+        "leverage": int(cfg.get("TRADE_LEVERAGE", "5")),
+        "amount": float(cfg.get("TRADE_AMOUNT", "1")),
+        "equity_pct": float(cfg.get("TRADE_EQUITY_PCT", "0")),
+        "equity_dry_usdt": float(cfg.get("TRADE_EQUITY_DRY_USDT", "5000")),
+        "order_type": cfg.get("TRADE_ORDER_TYPE", "limit"),
+        "position_mode": cfg.get("TRADE_POSITION_MODE", "net"),
+        "dry_run": dry_run,
+    }
+    if not hasattr(store, "load_credentials"):
+        return None
+    try:
+        row = store.load_credentials(telegram_id, exchange)
+    except Exception as e:
+        # Table missing / RLS / network — fall back to env trader
+        logger.warning(
+            "load_credentials failed for user %s (%s); using env trader",
+            telegram_id,
+            e,
+        )
+        return None
+    if not row:
+        return None
+    try:
+        api_key = decrypt(row["api_key_enc"])
+        secret = decrypt(row["secret_enc"])
+        extra = decrypt(row["extra_enc"]) if row.get("extra_enc") else ""
+    except Exception:
+        logger.exception("Failed to decrypt credentials for user %s", telegram_id)
+        return None
+
+    if exchange == "bybit":
+        return BybitTrader(
+            api_key=api_key,
+            secret=secret,
+            sandbox=row.get("sandbox", False),
+            demo=row.get("demo", False),
+            **common,
+        )
+    return OkxTrader(
+        api_key=api_key,
+        secret=secret,
+        password=extra,
+        sandbox=row.get("sandbox", False),
+        **common,
+    )
+
+
 def _register_bot_commands(
     bot_client: TelegramClient,
     *,
@@ -244,49 +297,208 @@ def _register_bot_commands(
     trader: Trader,
     session_started: float,
     exchange: str,
+    cfg: dict,
 ) -> None:
-    @bot_client.on(events.NewMessage(pattern=r"^/(start|status)(@\w+)?$"))
+    @bot_client.on(events.NewMessage(pattern=r"^/status(@\w+)?$"))
     async def on_bot_command(event: events.NewMessage.Event) -> None:
         if event.sender_id != owner_id:
             return
-        cmd = event.pattern_match.group(1)
-        if cmd == "start":
-            await _cmd_start(
-                event,
-                channel=channel,
-                signal_chat=signal_chat,
-                dry_run=dry_run,
-                sandbox=sandbox,
-                exchange=exchange,
-            )
-        elif cmd == "status":
-            await _cmd_status(
-                event,
-                channel=channel,
-                signal_chat=signal_chat,
-                dry_run=dry_run,
-                sandbox=sandbox,
-                store=store,
-                trader=trader,
-                session_started=session_started,
-                exchange=exchange,
-            )
+        await _cmd_status(
+            event,
+            channel=channel,
+            signal_chat=signal_chat,
+            dry_run=dry_run,
+            sandbox=sandbox,
+            store=store,
+            trader=trader,
+            session_started=session_started,
+            exchange=exchange,
+        )
 
+    @bot_client.on(events.NewMessage(pattern=r"^/setkey\b"))
+    async def on_setkey(event: events.NewMessage.Event) -> None:
+        """
+        /setkey okx API_KEY SECRET PASSWORD
+        /setkey bybit API_KEY SECRET
+        /setkey bybit API_KEY SECRET --demo
+        Only works in private chat (not in groups). Owner only.
+        """
+        # Delete message immediately to avoid key exposure in chat history
+        try:
+            await event.delete()
+        except Exception:
+            pass
+
+        if event.sender_id != owner_id:
+            return
+
+        if event.is_group or event.is_channel:
+            await bot_client.send_message(
+                event.sender_id,
+                "⚠️ Gunakan /setkey di private chat dengan bot ini saja, bukan di grup.",
+            )
+            return
+
+        parts = event.raw_text.strip().split()
+        # parts: ['/setkey', exchange, key, secret, (password|--demo)]
+        if len(parts) < 4:
+            await event.respond(
+                "❌ Format salah.\n\n"
+                "Lebih mudah: /settings → 🔑 Set API Key\n\n"
+                "OKX: `/setkey okx API_KEY SECRET PASSWORD`\n"
+                "Bybit: `/setkey bybit API_KEY SECRET`\n"
+                "Bybit demo: `/setkey bybit API_KEY SECRET --demo`",
+            )
+            return
+
+        exch = parts[1].lower()
+        if exch not in ("okx", "bybit"):
+            await event.respond("❌ Exchange harus `okx` atau `bybit`.")
+            return
+
+        api_key_plain = parts[2]
+        secret_plain = parts[3]
+        extra_plain = ""
+        is_demo = False
+        is_sandbox = False
+
+        if exch == "okx":
+            if len(parts) < 5:
+                await event.respond("❌ OKX butuh PASSWORD (passphrase). `/setkey okx KEY SECRET PASSWORD`")
+                return
+            extra_plain = parts[4]
+        elif exch == "bybit":
+            flags = [p.lower() for p in parts[4:]]
+            if "--demo" in flags:
+                is_demo = True
+            elif "--sandbox" in flags:
+                is_sandbox = True
+
+        if not hasattr(store, "save_credentials"):
+            await event.respond("❌ Store tidak support penyimpanan credentials.")
+            return
+
+        try:
+            api_key_enc = encrypt(api_key_plain)
+            secret_enc = encrypt(secret_plain)
+            extra_enc = encrypt(extra_plain) if extra_plain else None
+        except RuntimeError as e:
+            await event.respond(f"❌ Enkripsi gagal: {e}")
+            return
+
+        try:
+            await asyncio.to_thread(
+                store.save_credentials,
+                event.sender_id,
+                exch,
+                api_key_enc=api_key_enc,
+                secret_enc=secret_enc,
+                extra_enc=extra_enc,
+                sandbox=is_sandbox,
+                demo=is_demo,
+            )
+        except Exception as e:
+            logger.exception("save_credentials failed")
+            await event.respond(f"❌ Gagal simpan: {e}")
+            return
+
+        mode = "demo" if is_demo else ("sandbox" if is_sandbox else "live")
+        await event.respond(
+            f"✅ API key {exch.upper()} berhasil disimpan (mode: {mode}).\n"
+            "Key dienkripsi dan tidak bisa dibaca kembali.\n"
+            "Atau pakai /settings untuk menu tombol."
+        )
+        logger.info("Credentials saved for user %s exchange=%s mode=%s", event.sender_id, exch, mode)
+
+    @bot_client.on(events.NewMessage(pattern=r"^/delkey\b"))
+    async def on_delkey(event: events.NewMessage.Event) -> None:
+        """Delete stored credentials: /delkey okx"""
+        if event.sender_id != owner_id:
+            return
+        parts = event.raw_text.strip().split()
+        if len(parts) < 2:
+            await event.respond("❌ Format: `/delkey okx` atau `/delkey bybit`")
+            return
+        exch = parts[1].lower()
+        if exch not in ("okx", "bybit"):
+            await event.respond("❌ Exchange harus `okx` atau `bybit`.")
+            return
+        if not hasattr(store, "delete_credentials"):
+            await event.respond("❌ Store tidak support hapus credentials.")
+            return
+        deleted = await asyncio.to_thread(store.delete_credentials, event.sender_id, exch)
+        if deleted:
+            await event.respond(f"🗑 API key {exch.upper()} berhasil dihapus.")
+        else:
+            await event.respond(f"ℹ️ Tidak ada key {exch.upper()} yang tersimpan.")
+
+    @bot_client.on(events.NewMessage(pattern=r"^/mykeys$"))
+    async def on_mykeys(event: events.NewMessage.Event) -> None:
+        """List registered exchanges (without showing key values)."""
+        if event.sender_id != owner_id:
+            return
+        if not hasattr(store, "list_credentials"):
+            await event.respond("ℹ️ Fitur multi-user belum tersedia di store ini.")
+            return
+        rows = await asyncio.to_thread(store.list_credentials, event.sender_id)
+        if not rows:
+            await event.respond(
+                "ℹ️ Belum ada API key yang terdaftar.\n\n"
+                "Pakai /settings → 🔑 Set API Key\n"
+                "atau:\n"
+                "`/setkey okx API_KEY SECRET PASSWORD`\n"
+                "`/setkey bybit API_KEY SECRET`"
+            )
+            return
+        lines = ["🔑 API key terdaftar:\n"]
+        for r in rows:
+            exch = r["exchange"].upper()
+            mode = "demo" if r.get("demo") else ("sandbox" if r.get("sandbox") else "live")
+            lines.append(f"• {exch} — {mode}")
+        await event.respond("\n".join(lines))
+
+    register_settings_menu(
+        bot_client,
+        owner_id=owner_id,
+        channel=channel,
+        signal_chat=signal_chat,
+        dry_run=dry_run,
+        sandbox=sandbox,
+        store=store,
+        trader=trader,
+        session_started=session_started,
+        exchange=exchange,
+        cfg=cfg,
+    )
 
 async def _run_session(cfg: dict, secrets: dict) -> None:
     """One Telethon connection lifecycle — never reuse client across loops."""
     channel = get_active_channel(cfg)
+    watch_channels = list_enabled_channels(cfg)
+    if not watch_channels:
+        watch_channels = [channel]
     signal_chat = channel.chat_id
+    watch_chats = sorted({c.chat_id for c in watch_channels})
     notif_chat = int(cfg.get("NOTIF_CHAT_ID", "6878724303"))
     owner_id = int(cfg.get("OWNER_ID", notif_chat))
     session_started = time.monotonic()
     logger.info(
-        "Active channel: %s (%s) parser=%s chat_id=%s",
+        "Active channel: %s (%s) parser=%s chat_id=%s topic=%s",
         channel.key,
         channel.name,
         channel.parser,
         channel.chat_id,
+        channel.topic_id,
     )
+    for c in watch_channels:
+        logger.info(
+            "Watch: %s parser=%s chat_id=%s topic=%s parse_only=%s",
+            c.key,
+            c.parser,
+            c.chat_id,
+            c.topic_id,
+            c.parse_only,
+        )
 
     dry_run = cfg.get("TRADE_DRY_RUN", "true").lower() in ("1", "true", "yes")
     exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
@@ -302,10 +514,11 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
     api_hash = cfg.get("TELEGRAM_API_HASH") or secrets.get("api_hash", "")
     bot_token = cfg.get("TELEGRAM_BOT_TOKEN") or secrets.get("bot_token", "")
 
-    user_session = DATA / "forwarder"
+    # Dedicated user session — do NOT share data/forwarder.session with forwarder.py
+    user_session = DATA / "okx_user"
     bot_session = DATA / "okx_signal_bot"
     cmd_bot_session = DATA / "okx_cmd_bot"
-    use_user = (DATA / "forwarder.session").exists()
+    use_user = (DATA / "okx_user.session").exists()
 
     client = TelegramClient(
         str(user_session if use_user else bot_session),
@@ -323,7 +536,11 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
         if use_user:
             await client.connect()
             if not await client.is_user_authorized():
-                raise SystemExit("User session missing — run: uv run python login_user.py")
+                raise SystemExit(
+                    "okx_user.session missing or unauthorized. "
+                    "Run: uv run python login_user.py --name okx_user --send-otp "
+                    "then --name okx_user --keep-session --code OTP"
+                )
             logger.info("Using user session")
             if not bot_token:
                 raise SystemExit("Need TELEGRAM_BOT_TOKEN for /start and /status commands")
@@ -348,16 +565,18 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             trader=trader,
             session_started=session_started,
             exchange=exchange,
+            cfg=cfg,
         )
 
         me = await client.get_me()
         logger.info(
-            "Logged in as %s | exchange=%s | dry_run=%s | sandbox=%s | watch=%s",
+            "Logged in as %s | exchange=%s | dry_run=%s | sandbox=%s | parse_only=%s | watch=%s",
             me.id,
             exchange,
             dry_run,
             sandbox,
-            signal_chat,
+            cfg.get("SIGNAL_PARSE_ONLY", "false"),
+            watch_chats,
         )
         notify_client = bot_client if bot_client is not None else client
 
@@ -367,19 +586,33 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             except Exception as e:
                 logger.error("Notify failed: %s", e)
 
-        @client.on(events.NewMessage(chats=signal_chat))
+        @client.on(events.NewMessage(chats=watch_chats))
         async def on_signal(event: events.NewMessage.Event) -> None:
+            src_chat = event.chat_id
+            topic = _message_topic_id(event.message)
+            src = match_channel(watch_channels, src_chat, topic)
+            if src is None:
+                return
             text = event.raw_text or ""
-            signal = channel.parse(text)
+            if src.parser == "cryptocium" and "SETUP" not in text.upper():
+                return
+            signal = src.parse(text)
             if not signal:
                 preview = (text[:80] or "").replace("\n", " ")
-                logger.info("Skip msg %s (not a signal): %s", event.id, preview)
+                logger.info(
+                    "Skip msg %s chat=%s topic=%s (%s): %s",
+                    event.id,
+                    src_chat,
+                    topic,
+                    src.key,
+                    preview,
+                )
                 if hasattr(store, "add_signal_event"):
                     await _run_sync(
                         store.add_signal_event,
                         raw_text=text[:4000],
-                        channel_key=channel.key,
-                        chat_id=signal_chat,
+                        channel_key=src.key,
+                        chat_id=src_chat,
                         message_id=event.id,
                         parsed=False,
                     )
@@ -397,6 +630,38 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                 signal.window_end,
                 signal.swap_symbol,
             )
+            parse_only = src.parse_only or cfg.get("SIGNAL_PARSE_ONLY", "false").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            parse_msg = (
+                f"📥 Parsed ({src.key})\n"
+                f"Chat: {src_chat} topic={topic}\n"
+                f"Pair: {signal.pair} → {signal.swap_symbol}\n"
+                f"Side: {signal.side}\n"
+                f"Entry: {signal.entry}\n"
+                f"SL: {signal.stop_loss or '-'}\n"
+                f"TP: {signal.take_profit or '-'}\n"
+                f"Leverage: {signal.leverage or '-'}x\n"
+                f"Timeframe: {signal.timeframe_raw or '-'}\n"
+                f"Window: {signal.window_start or '-'} → {signal.window_end or '-'}"
+            )
+            if parse_only:
+                parse_msg += "\n\n⏸ parse_only — belum order"
+                await _dm(parse_msg)
+                if hasattr(store, "add_signal_event"):
+                    await _run_sync(
+                        store.add_signal_event,
+                        raw_text=text[:4000],
+                        channel_key=src.key,
+                        chat_id=src_chat,
+                        message_id=event.id,
+                        parsed=True,
+                        parse_error="parse_only",
+                    )
+                return
+
             if signal.is_expired:
                 msg = (
                     f"⏭ Signal expired, skip\n"
@@ -410,24 +675,32 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     await _run_sync(
                         store.add_signal_event,
                         raw_text=text[:4000],
-                        channel_key=channel.key,
-                        chat_id=signal_chat,
+                        channel_key=src.key,
+                        chat_id=src_chat,
                         message_id=event.id,
                         parsed=True,
                         parse_error="expired",
                     )
                 return
 
+            # Allow test runs to force .env credentials by disabling DB preference.
+            active_trader = await _run_sync(_load_user_trader, store, owner_id, cfg) or trader
+            logger.info(
+                "Using trader: %s (per-user=%s)",
+                active_trader.exchange_name,
+                active_trader is not trader,
+            )
+
             order_id = None
             trade_id = None
             try:
-                order = await _run_sync(trader.place_order, signal)
+                order = await _run_sync(active_trader.place_order, signal)
                 order_id = order.get("id") or order.get("info", {}).get("ordId")
                 try:
                     trade_id = await _run_sync(
                         store.add_trade,
                         source="live",
-                        channel_key=channel.key,
+                        channel_key=src.key,
                         pair=signal.pair,
                         symbol=signal.swap_symbol,
                         side=signal.side,
@@ -478,8 +751,8 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                 await _run_sync(
                     store.add_signal_event,
                     raw_text=text[:4000],
-                    channel_key=channel.key,
-                    chat_id=signal_chat,
+                    channel_key=src.key,
+                    chat_id=src_chat,
                     message_id=event.id,
                     parsed=True,
                     trade_id=trade_id,
@@ -492,7 +765,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     asyncio.create_task(
                         _cancel_when_window_ends(
                             client=notify_client,
-                            trader=trader,
+                            trader=active_trader,
                             store=store,
                             notif_chat=notif_chat,
                             order_id=str(order_id),
@@ -502,7 +775,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     )
                 )
 
-        print(f"Listening for signals in {signal_chat} (Ctrl+C to stop)")
+        print(f"Listening for signals in {watch_chats} (Ctrl+C to stop)")
         if bot_client is not client:
             await asyncio.gather(
                 client.run_until_disconnected(),

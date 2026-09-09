@@ -101,7 +101,18 @@ docker compose logs -f okx_bot
 
 Production deploy to GCP: see **[DEPLOY.md](../DEPLOY.md)**.
 
-## Weekly metrics
+## Bot commands (owner, private chat)
+
+| Command | Action |
+|---------|--------|
+| `/start` or `/settings` | Inline menu: set / list / delete / test API keys |
+| `/status` | Bot uptime + channel / dry-run info |
+| `/setkey …` | Text shortcut (message auto-deleted) |
+| `/mykeys` / `/delkey` | List or delete without menu |
+
+Credentials are Fernet-encrypted in `user_credentials` (needs `CREDENTIAL_ENCRYPTION_KEY` + Supabase/Postgres store).
+
+
 
 - **Win rate** — profitable closed trades ÷ decisive trades  
 - **ROI** — equity change over the period  

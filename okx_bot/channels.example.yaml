@@ -2,9 +2,11 @@
 #
 # parser values (built-in):
 #   dex_vip      — DEX VIP format (Position/Entry Price/TP/SL/Timeframe WIB)
+#   cryptocium   — SETUP LONG/SHORT, Pair $XXX, Entry/SL; TP = 2R
 #   okx_confirm  — legacy "Sinyal diterima / Order berhasil" format
 #
 # Same parser can be reused by multiple channels if the text layout matches.
+# topic_id: forum thread in a group (omit = entire chat)
 
 active: dex_vip
 
@@ -14,6 +16,14 @@ channels:
     chat_id: -1002290536326
     parser: dex_vip
     enabled: true
+
+  cryptocium:
+    name: "Cryptocium SETUP"
+    chat_id: -1003751705288
+    topic_id: 12160
+    parser: cryptocium
+    enabled: true
+    parse_only: true  # DM parse only; set false to trade
 
   # Example: another channel with the same text format — only change chat_id
   # dex_vip_backup:

@@ -52,11 +52,19 @@ async def main() -> None:
     parser.add_argument(
         "--keep-session",
         action="store_true",
-        help="Do not delete existing forwarder.session before login",
+        help="Do not delete the target .session file before login",
+    )
+    parser.add_argument(
+        "--name",
+        default="forwarder",
+        help="Session basename under data/ (default: forwarder → data/forwarder.session). "
+        "Use okx_user for a second login so okx_bot does not share the forwarder session.",
     )
     args = parser.parse_args()
     otp = (args.code or os.environ.get("TELEGRAM_OTP") or "").strip()
     password = args.password or os.environ.get("TELEGRAM_2FA_PASSWORD")
+    session_stem = args.name.strip().replace(".session", "")
+    session_path = paths.DATA_DIR / session_stem
 
     paths.ensure_data_dir()
     with open(paths.SECRETS_PATH) as f:
@@ -64,8 +72,8 @@ async def main() -> None:
 
     if not args.keep_session:
         for p in (
-            paths.DATA_DIR / "forwarder.session",
-            paths.DATA_DIR / "forwarder.session-journal",
+            paths.DATA_DIR / f"{session_stem}.session",
+            paths.DATA_DIR / f"{session_stem}.session-journal",
             HASH_PATH,
         ):
             if p.exists():
@@ -73,7 +81,7 @@ async def main() -> None:
                 print(f"Removed old {p.name}")
 
     client = TelegramClient(
-        str(paths.USER_SESSION),
+        str(session_path),
         int(secrets["api_id"]),
         secrets["api_hash"],
     )
@@ -129,7 +137,7 @@ async def main() -> None:
     print(f"✓ User logged in as @{me.username or me.first_name} id={me.id}")
     await client.disconnect()
     print()
-    print("Session saved: data/forwarder.session")
+    print(f"Session saved: data/{session_stem}.session")
     print("Next:")
     print("  PYTHONPATH=. uv run python -m okx_bot")
 

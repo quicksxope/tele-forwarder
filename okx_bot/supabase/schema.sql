@@ -141,3 +141,33 @@ alter table public.signal_events enable row level security;
 comment on table public.trades is 'OKX signal bot fills (live + backtest)';
 comment on table public.equity_snapshots is 'Equity marks for ROI reporting';
 comment on table public.signal_events is 'Raw Telegram signals audit log';
+
+-- ---------------------------------------------------------------------------
+-- user_credentials (per-user exchange API keys, encrypted at application layer)
+-- ---------------------------------------------------------------------------
+create table if not exists public.user_credentials (
+  id           bigserial primary key,
+  telegram_id  bigint not null,
+  exchange     text not null check (exchange in ('okx', 'bybit')),
+  api_key_enc  text not null,   -- Fernet-encrypted API key
+  secret_enc   text not null,   -- Fernet-encrypted API secret
+  extra_enc    text,            -- Fernet-encrypted passphrase (OKX) or empty (Bybit)
+  sandbox      boolean not null default false,
+  demo         boolean not null default false,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  unique (telegram_id, exchange)
+);
+
+create index if not exists idx_user_credentials_telegram
+  on public.user_credentials (telegram_id);
+
+drop trigger if exists trg_user_credentials_updated_at on public.user_credentials;
+create trigger trg_user_credentials_updated_at
+  before update on public.user_credentials
+  for each row execute function public.set_updated_at();
+
+-- RLS: only service_role can read/write (anon and authenticated are denied)
+alter table public.user_credentials enable row level security;
+
+comment on table public.user_credentials is 'Per-user exchange API credentials (Fernet-encrypted, keyed by Telegram user ID)';

@@ -15,11 +15,12 @@ _PARSERS: dict[str, ParseFn] | None = None
 def _load() -> dict[str, ParseFn]:
     global _PARSERS
     if _PARSERS is None:
-        from . import dex_vip, okx_confirm
+        from . import cryptocium, dex_vip, okx_confirm
 
         _PARSERS = {
             "dex_vip": dex_vip.parse,
             "okx_confirm": okx_confirm.parse,
+            "cryptocium": cryptocium.parse,
         }
     return _PARSERS
 

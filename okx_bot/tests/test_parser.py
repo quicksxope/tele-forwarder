@@ -47,7 +47,34 @@ def test_dex_vip_format():
     assert s.timeframe_raw is not None
 
 
+CRYPTOCIUM = """
+☄️ SETUP - SHORT
+
+📊 Pair : $VVV
+
+⌛ Time frame : 1h
+
+🔔 Entry : 16.700
+
+🎯 Target : on chart
+
+❌ Stop loss : 17.200
+"""
+
+
+def test_cryptocium_2r_short():
+    s = parse_signal(CRYPTOCIUM, parser="cryptocium")
+    assert s is not None
+    assert s.pair == "VVV/USDT"
+    assert s.side == "sell"
+    assert s.entry == 16.7
+    assert s.stop_loss == 17.2
+    assert s.take_profit == 15.7
+    assert s.leverage == 10
+
+
 if __name__ == "__main__":
     test_legacy_confirm_block()
     test_dex_vip_format()
+    test_cryptocium_2r_short()
     print("OK")
