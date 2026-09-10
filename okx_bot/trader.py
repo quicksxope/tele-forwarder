@@ -18,7 +18,9 @@ class Trader(Protocol):
     equity_pct: float
     dry_run: bool
 
-    def place_order(self, signal: Signal) -> dict[str, Any]: ...
+    def place_order(
+        self, signal: Signal, *, order_type: str | None = None
+    ) -> dict[str, Any]: ...
 
     def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
 
@@ -162,11 +164,14 @@ class OkxTrader:
             exchange_label="OKX",
         )
 
-    def place_order(self, signal: Signal) -> dict[str, Any]:
+    def place_order(
+        self, signal: Signal, *, order_type: str | None = None
+    ) -> dict[str, Any]:
         symbol = signal.swap_symbol
         leverage = signal.leverage or self.default_leverage
         params = self._params(signal)
-        price = signal.entry if self.order_type == "limit" else None
+        otype = order_type or self.order_type
+        price = signal.entry if otype == "limit" else None
 
         if not self.dry_run:
             self.exchange.load_markets()
@@ -177,7 +182,7 @@ class OkxTrader:
 
         payload = {
             "symbol": symbol,
-            "type": self.order_type,
+            "type": otype,
             "side": signal.side,
             "amount": amount,
             "price": price,
@@ -192,7 +197,7 @@ class OkxTrader:
         self.ensure_leverage(symbol, leverage)
         return self.exchange.create_order(
             symbol,
-            self.order_type,
+            otype,
             signal.side,
             amount,
             price,
@@ -338,11 +343,14 @@ class BybitTrader:
             exchange_label="Bybit",
         )
 
-    def place_order(self, signal: Signal) -> dict[str, Any]:
+    def place_order(
+        self, signal: Signal, *, order_type: str | None = None
+    ) -> dict[str, Any]:
         symbol = signal.swap_symbol
         leverage = signal.leverage or self.default_leverage
         params = self._params(signal)
-        price = signal.entry if self.order_type == "limit" else None
+        otype = order_type or self.order_type
+        price = signal.entry if otype == "limit" else None
 
         if not self.dry_run:
             self.exchange.load_markets()
@@ -353,7 +361,7 @@ class BybitTrader:
 
         payload = {
             "symbol": symbol,
-            "type": self.order_type,
+            "type": otype,
             "side": signal.side,
             "amount": amount,
             "price": price,
@@ -369,7 +377,7 @@ class BybitTrader:
         self.ensure_leverage(symbol, leverage)
         return self.exchange.create_order(
             symbol,
-            self.order_type,
+            otype,
             signal.side,
             amount,
             price,

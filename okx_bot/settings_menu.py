@@ -75,29 +75,66 @@ def _clear_wizard(uid: int) -> None:
     _wizards.pop(uid, None)
 
 
-def _menu_text(*, channel, signal_chat: int, dry_run: bool, sandbox: bool, exchange: str) -> str:
+def _menu_text(*, channel, signal_chat: int, dry_run: bool, sandbox: bool, exchange: str, watch_channels=None) -> str:
     mode = "dry-run" if dry_run else "live"
     venue = "sandbox/testnet" if sandbox else "production"
+    watch_lines = ""
+    if watch_channels:
+        parts = []
+        for c in watch_channels:
+            tag = "parse" if c.parse_only else "trade"
+            parts.append(f"{c.key}[{tag}]")
+        watch_lines = f"Watch: {', '.join(parts)}\n"
     return (
         f"🤖 {exchange.upper()} Signal Bot\n\n"
-        f"Channel: {channel.name}\n"
+        f"Active profile: {channel.name}\n"
         f"Parser: {channel.parser}\n"
-        f"Watch: {signal_chat}\n"
+        f"{watch_lines}"
+        f"Signal chat (active): {signal_chat}\n"
         f"Exchange (default): {exchange}\n"
         f"Trading: {mode} ({venue})\n\n"
-        "Menu: Assets · PnL · ROI · API keys\n"
+        "Menu: Assets · Positions · PnL · ROI (filter per channel)\n"
         "Hanya owner · private chat saja."
     )
 
 
-def _period_metrics_text(store, *, weeks: int, source: str, title: str) -> str:
+def _channel_filter_keyboard(prefix: str, watch_channels) -> list[list[Any]]:
+    """prefix e.g. pos / pnl / roi → callbacks pos:all, pos:dex_vip, …"""
+    rows: list[list[Any]] = [[Button.inline("All channels", f"{prefix}:all".encode())]]
+    row: list[Any] = []
+    for c in watch_channels or []:
+        row.append(Button.inline(c.key, f"{prefix}:{c.key}".encode()))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([Button.inline("« Menu", b"menu:main"), Button.inline("✕ Cancel", b"menu:cancel")])
+    return rows
+
+
+def _channel_label(channel_key: str | None) -> str:
+    return channel_key or "unknown"
+
+
+def _period_metrics_text(
+    store,
+    *,
+    weeks: int,
+    source: str,
+    title: str,
+    channel_key: str | None = None,
+) -> str:
     if not hasattr(store, "trades_between"):
         return "ℹ️ Store tidak support metrics."
     start, end = period_bounds(weeks)
-    trades = store.trades_between(start, end, source=source, closed_only=True)
+    trades = store.trades_between(
+        start, end, source=source, closed_only=True, channel_key=channel_key
+    )
     equity_start = None
     equity_end = None
-    if hasattr(store, "latest_equity_before"):
+    # Wallet equity is shared — only meaningful for All view.
+    if channel_key is None and hasattr(store, "latest_equity_before"):
         equity_start = store.latest_equity_before(start, source=source)
         equity_end = store.latest_equity_before(end, source=source)
         if equity_start is None and source == "live":
@@ -113,11 +150,12 @@ def _period_metrics_text(store, *, weeks: int, source: str, title: str) -> str:
     return metrics.to_telegram(title)
 
 
-def _assets_text(store, trader, cfg: dict) -> str:
-    lines = ["💼 Asset tracker\n"]
+def _assets_text(store, trader, cfg: dict, *, channel_key: str | None = None) -> str:
+    scope = "All" if not channel_key else channel_key
+    lines = [f"💼 Asset tracker · {scope}\n"]
     now = datetime.now(timezone.utc)
 
-    # Live exchange balance (env / default trader)
+    # Live exchange balance is always wallet-level (shared).
     try:
         bal = trader.exchange.fetch_balance()
         usdt = bal.get("USDT") or {}
@@ -129,14 +167,16 @@ def _assets_text(store, trader, cfg: dict) -> str:
         demo = getattr(trader, "demo", False)
         mode = "demo" if demo else ("sandbox" if sandbox else "live")
         dry = getattr(trader, "dry_run", True)
-        lines.append(f"Exchange: {exch} ({mode})" + (" · dry-run" if dry else ""))
+        lines.append(f"Exchange wallet: {exch} ({mode})" + (" · dry-run" if dry else ""))
         lines.append(f"USDT free: {free}")
         lines.append(f"USDT used: {used}")
         lines.append(f"USDT total: {total}")
+        if channel_key:
+            lines.append("(wallet shared — filter only applies to DB opens)")
     except Exception as e:
         lines.append(f"⚠️ Balance fetch gagal: {type(e).__name__}: {e}")
 
-    if hasattr(store, "latest_equity_before"):
+    if channel_key is None and hasattr(store, "latest_equity_before"):
         eq = store.latest_equity_before(now, source="live")
         if eq is None:
             eq = store.latest_equity_before(now, source="backtest")
@@ -148,21 +188,22 @@ def _assets_text(store, trader, cfg: dict) -> str:
     opens = []
     if hasattr(store, "list_open_trades"):
         try:
-            opens = store.list_open_trades(source="live", limit=15)
+            opens = store.list_open_trades(source="live", limit=30, channel_key=channel_key)
         except Exception as e:
             lines.append(f"\n⚠️ Open trades: {type(e).__name__}: {e}")
             opens = []
 
-    lines.append(f"\nOpen positions (DB): {len(opens)}")
+    lines.append(f"\nOpen trades (DB · {scope}): {len(opens)}")
     if not opens:
         lines.append("• (kosong)")
     else:
-        for t in opens[:10]:
+        for t in opens[:12]:
             side = (t.side or "?").upper()
             lev = f"{t.leverage}x" if t.leverage else "?"
-            lines.append(f"• {t.pair} {side} @ {t.entry} · {lev} · amt {t.amount}")
-        if len(opens) > 10:
-            lines.append(f"• … +{len(opens) - 10} lagi")
+            ch = _channel_label(getattr(t, "channel_key", None))
+            lines.append(f"• [{ch}] {t.pair} {side} @ {t.entry} · {lev} · amt {t.amount}")
+        if len(opens) > 12:
+            lines.append(f"• … +{len(opens) - 12} lagi")
 
     return "\n".join(lines)
 
@@ -173,7 +214,7 @@ def _norm_sym(s: str | None) -> str:
     return s.replace(":USDT", "").replace("-SWAP", "").replace("-", "/").upper()
 
 
-def _positions_text(store, trader) -> str:
+def _positions_text(store, trader, *, channel_key: str | None = None) -> str:
     """OKX live positions + DB open-trade match (OKX-first)."""
     exch = getattr(trader, "exchange_name", "").lower()
     if exch != "okx" or not hasattr(trader, "fetch_open_positions"):
@@ -185,7 +226,8 @@ def _positions_text(store, trader) -> str:
 
     sandbox = getattr(trader, "sandbox", False)
     mode = "sandbox" if sandbox else "live"
-    lines = [f"📍 Active positions · OKX ({mode})\n"]
+    scope = "All" if not channel_key else channel_key
+    lines = [f"📍 Active positions · OKX ({mode}) · {scope}\n"]
 
     try:
         positions = trader.fetch_open_positions()
@@ -195,7 +237,7 @@ def _positions_text(store, trader) -> str:
     db_opens = []
     if hasattr(store, "list_open_trades"):
         try:
-            db_opens = store.list_open_trades(source="live", limit=50)
+            db_opens = store.list_open_trades(source="live", limit=50, channel_key=channel_key)
         except Exception as e:
             lines.append(f"⚠️ DB open trades: {type(e).__name__}: {e}\n")
 
@@ -205,11 +247,18 @@ def _positions_text(store, trader) -> str:
         by_sym.setdefault(key, []).append(t)
 
     matched_ids: set[int] = set()
+    shown = 0
     if not positions:
         lines.append("Tidak ada posisi terbuka di OKX.")
     else:
-        lines.append(f"OKX open: {len(positions)}\n")
-        for i, p in enumerate(positions, 1):
+        if channel_key is None:
+            lines.append(f"OKX open: {len(positions)}\n")
+        for p in positions:
+            key = _norm_sym(p.get("symbol"))
+            hits = by_sym.get(key) or []
+            if channel_key and not hits:
+                continue
+            shown += 1
             side = (p.get("side") or "?").upper()
             entry = p.get("entry")
             mark = p.get("mark")
@@ -221,18 +270,17 @@ def _positions_text(store, trader) -> str:
             upnl_s = f"{upnl:+.4f}" if upnl is not None else "?"
             lev_s = f"{lev:g}x" if lev is not None else "?"
             lines.append(
-                f"{i}. {p.get('symbol')}\n"
+                f"{shown}. {p.get('symbol')}\n"
                 f"   {side} · size {contracts} · lev {lev_s}\n"
                 f"   entry {entry_s} · mark {mark_s}\n"
                 f"   uPnL {upnl_s} USDT"
             )
-            key = _norm_sym(p.get("symbol"))
-            hits = by_sym.get(key) or []
             if hits:
                 t = hits[0]
                 matched_ids.add(t.id)
+                ch = _channel_label(getattr(t, "channel_key", None))
                 lines.append(
-                    f"   DB: #{t.id} {t.pair} {(t.side or '').upper()} "
+                    f"   DB: #{t.id} [{ch}] {t.pair} {(t.side or '').upper()} "
                     f"signal entry {t.entry}"
                     + (f" TP {t.take_profit}" if t.take_profit else "")
                     + (f" SL {t.stop_loss}" if t.stop_loss else "")
@@ -240,13 +288,16 @@ def _positions_text(store, trader) -> str:
             else:
                 lines.append("   DB: (tidak ada open trade cocok)")
             lines.append("")
+        if channel_key and shown == 0:
+            lines.append(f"Tidak ada posisi OKX yang match channel `{channel_key}`.")
 
     stale = [t for t in db_opens if t.id not in matched_ids]
     if stale:
         lines.append(f"DB stale (open di DB, tidak di OKX): {len(stale)}")
         for t in stale[:8]:
+            ch = _channel_label(getattr(t, "channel_key", None))
             lines.append(
-                f"• #{t.id} {t.pair} {(t.side or '').upper()} @ {t.entry} "
+                f"• #{t.id} [{ch}] {t.pair} {(t.side or '').upper()} @ {t.entry} "
                 f"(order {t.order_id or '-'})"
             )
         if len(stale) > 8:
@@ -255,23 +306,44 @@ def _positions_text(store, trader) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _pnl_text(store) -> str:
-    text_7 = _period_metrics_text(store, weeks=1, source="live", title="PnL · 7 hari (live)")
-    text_30 = _period_metrics_text(store, weeks=4, source="live", title="PnL · 30 hari (live)")
+def _pnl_text(store, *, channel_key: str | None = None) -> str:
+    scope = "All" if not channel_key else channel_key
+    text_7 = _period_metrics_text(
+        store,
+        weeks=1,
+        source="live",
+        title=f"PnL · 7 hari · {scope}",
+        channel_key=channel_key,
+    )
+    text_30 = _period_metrics_text(
+        store,
+        weeks=4,
+        source="live",
+        title=f"PnL · 30 hari · {scope}",
+        channel_key=channel_key,
+    )
     return f"{text_7}\n\n————\n\n{text_30}"
 
 
-def _roi_text(store) -> str:
+def _roi_text(store, *, channel_key: str | None = None) -> str:
     """ROI-focused view from equity snapshots + trade PnL (same metrics engine)."""
+    scope = "All" if not channel_key else channel_key
     chunks: list[str] = []
+    if channel_key:
+        chunks.append(
+            f"ℹ️ Channel `{channel_key}`: ROI dari trade PnL saja "
+            "(wallet OKX shared, tidak di-split)."
+        )
     for weeks, label in ((1, "7 hari"), (4, "30 hari")):
         start, end = period_bounds(weeks)
         equity_start = equity_end = None
-        if hasattr(store, "latest_equity_before"):
+        if channel_key is None and hasattr(store, "latest_equity_before"):
             equity_start = store.latest_equity_before(start, source="live")
             equity_end = store.latest_equity_before(end, source="live")
         trades = (
-            store.trades_between(start, end, source="live", closed_only=True)
+            store.trades_between(
+                start, end, source="live", closed_only=True, channel_key=channel_key
+            )
             if hasattr(store, "trades_between")
             else []
         )
@@ -286,7 +358,7 @@ def _roi_text(store) -> str:
         eq_s = f"{m.equity_start:.4f}" if m.equity_start is not None else "n/a"
         eq_e = f"{m.equity_end:.4f}" if m.equity_end is not None else "n/a"
         chunks.append(
-            f"📉 ROI · {label}\n"
+            f"📉 ROI · {label} · {scope}\n"
             f"Period: {start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}\n"
             f"Equity start: {eq_s}\n"
             f"Equity end: {eq_e}\n"
@@ -360,8 +432,10 @@ def register_settings_menu(
     session_started: float,
     exchange: str,
     cfg: dict,
+    watch_channels=None,
 ) -> None:
     """Register /settings, callback buttons, and wizard reply handlers."""
+    channels = list(watch_channels or [channel])
 
     async def _show_main(event, *, edit: bool = False) -> None:
         text = _menu_text(
@@ -370,6 +444,7 @@ def register_settings_menu(
             dry_run=dry_run,
             sandbox=sandbox,
             exchange=exchange,
+            watch_channels=channels,
         )
         buttons = _main_keyboard()
         if edit and hasattr(event, "edit"):
@@ -499,29 +574,68 @@ def register_settings_menu(
             return
 
         if data == "menu:assets":
+            await event.edit(
+                "Assets — pilih channel:",
+                buttons=_channel_filter_keyboard("assets", channels),
+            )
+            return
+
+        if data.startswith("assets:"):
+            key = data.split(":", 1)[1]
+            channel_key = None if key == "all" else key
             await event.edit("⏳ Loading assets…")
-            text = await asyncio.to_thread(_assets_text, store, trader, cfg)
+            text = await asyncio.to_thread(
+                _assets_text, store, trader, cfg, channel_key=channel_key
+            )
             await event.edit(text, buttons=_back_keyboard())
             return
 
         if data == "menu:positions":
+            await event.edit(
+                "Positions — pilih channel:",
+                buttons=_channel_filter_keyboard("pos", channels),
+            )
+            return
+
+        if data.startswith("pos:"):
+            key = data.split(":", 1)[1]
+            channel_key = None if key == "all" else key
             await event.edit("⏳ Loading OKX positions…")
-            text = await asyncio.to_thread(_positions_text, store, trader)
-            # Telegram hard limit 4096
+            text = await asyncio.to_thread(
+                _positions_text, store, trader, channel_key=channel_key
+            )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"
             await event.edit(text, buttons=_back_keyboard())
             return
 
         if data == "menu:pnl":
+            await event.edit(
+                "PnL — pilih channel:",
+                buttons=_channel_filter_keyboard("pnl", channels),
+            )
+            return
+
+        if data.startswith("pnl:"):
+            key = data.split(":", 1)[1]
+            channel_key = None if key == "all" else key
             await event.edit("⏳ Loading PnL…")
-            text = await asyncio.to_thread(_pnl_text, store)
+            text = await asyncio.to_thread(_pnl_text, store, channel_key=channel_key)
             await event.edit(text, buttons=_back_keyboard())
             return
 
         if data == "menu:roi":
+            await event.edit(
+                "ROI — pilih channel:",
+                buttons=_channel_filter_keyboard("roi", channels),
+            )
+            return
+
+        if data.startswith("roi:"):
+            key = data.split(":", 1)[1]
+            channel_key = None if key == "all" else key
             await event.edit("⏳ Loading ROI…")
-            text = await asyncio.to_thread(_roi_text, store)
+            text = await asyncio.to_thread(_roi_text, store, channel_key=channel_key)
             await event.edit(text, buttons=_back_keyboard())
             return
 
@@ -530,12 +644,14 @@ def register_settings_menu(
             h, rem = divmod(uptime_s, 3600)
             m, s = divmod(rem, 60)
             store_name = type(store).__name__
+            watch = ", ".join(
+                f"{c.key}[{'parse' if c.parse_only else 'trade'}]" for c in channels
+            )
             text = (
                 f"📊 Status\n\n"
                 f"Uptime: {h}h {m}m {s}s\n"
-                f"Channel: {channel.key} ({channel.name})\n"
-                f"Watch: {signal_chat}\n"
-                f"Parser: {channel.parser}\n"
+                f"Active profile: {channel.key} ({channel.name})\n"
+                f"Watch: {watch}\n"
                 f"Exchange: {exchange}\n"
                 f"TRADE_DRY_RUN: {dry_run}\n"
                 f"Sandbox/testnet: {sandbox}\n"

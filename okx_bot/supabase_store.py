@@ -287,6 +287,7 @@ class SupabaseStore:
         *,
         source: str | None = None,
         closed_only: bool = True,
+        channel_key: str | None = None,
     ) -> list[TradeRow]:
         # PostgREST and-filters
         params: dict[str, str] = {
@@ -306,6 +307,8 @@ class SupabaseStore:
         }
         if source:
             params["source"] = f"eq.{source}"
+        if channel_key:
+            params["channel_key"] = f"eq.{channel_key}"
         if closed_only:
             params["status"] = "neq.open"
             params["closed_at"] = f"not.is.null"
@@ -340,7 +343,13 @@ class SupabaseStore:
             return None
         return float(rows[0]["equity"])
 
-    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+    def list_open_trades(
+        self,
+        *,
+        source: str | None = "live",
+        limit: int = 20,
+        channel_key: str | None = None,
+    ) -> list[TradeRow]:
         query: dict[str, str] = {
             "select": "*",
             "status": "eq.open",
@@ -349,6 +358,8 @@ class SupabaseStore:
         }
         if source:
             query["source"] = f"eq.{source}"
+        if channel_key:
+            query["channel_key"] = f"eq.{channel_key}"
         rows = self._request("GET", "trades", query=query) or []
         return [self._row(r) for r in rows]
 
@@ -376,6 +387,7 @@ class SupabaseStore:
             window_start=r.get("window_start"),
             window_end=r.get("window_end"),
             timeframe_raw=r.get("timeframe_raw"),
+            channel_key=r.get("channel_key"),
         )
 
 
@@ -586,6 +598,7 @@ class PostgresStore:
         *,
         source: str | None = None,
         closed_only: bool = True,
+        channel_key: str | None = None,
     ) -> list[TradeRow]:
         q = """
             SELECT * FROM trades
@@ -599,6 +612,9 @@ class PostgresStore:
         if source:
             q += " AND source=%s"
             params.append(source)
+        if channel_key:
+            q += " AND channel_key=%s"
+            params.append(channel_key)
         if closed_only:
             q += " AND closed_at IS NOT NULL AND status <> 'open'"
         q += " ORDER BY COALESCE(closed_at, opened_at)"
@@ -618,12 +634,21 @@ class PostgresStore:
             ).fetchone()
         return float(row["equity"]) if row else None
 
-    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+    def list_open_trades(
+        self,
+        *,
+        source: str | None = "live",
+        limit: int = 20,
+        channel_key: str | None = None,
+    ) -> list[TradeRow]:
         q = "SELECT * FROM trades WHERE status='open'"
         params: list[Any] = []
         if source:
             q += " AND source=%s"
             params.append(source)
+        if channel_key:
+            q += " AND channel_key=%s"
+            params.append(channel_key)
         q += " ORDER BY opened_at DESC LIMIT %s"
         params.append(limit)
         with self._connect() as conn:
@@ -664,6 +689,7 @@ class PostgresStore:
             window_start=_s(r.get("window_start")),
             window_end=_s(r.get("window_end")),
             timeframe_raw=r.get("timeframe_raw"),
+            channel_key=r.get("channel_key"),
         )
 
 

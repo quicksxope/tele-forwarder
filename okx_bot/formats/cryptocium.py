@@ -1,4 +1,8 @@
-"""Cryptocium SETUP signal format. TP is always 2R from stop distance."""
+"""Cryptocium SETUP / SWING SETUP format. TP is always 2R from stop distance.
+
+Chart ``Time frame`` (e.g. 30m, 4H) is informational only — not an entry window.
+Orders are always limit (see bot: cryptocium forces limit regardless of env).
+"""
 from __future__ import annotations
 
 import re
@@ -7,14 +11,17 @@ from ..parser import Signal
 from . import common as C
 
 SETUP_RE = re.compile(
-    r"SETUP\s*[-–:]\s*(LONG|SHORT|BUY|SELL)",
+    r"(?:SWING\s+)?SETUP\s*[-–:]\s*(LONG|SHORT|BUY|SELL)(?:\s*/\s*(?:BUY|SELL))?",
     re.I,
 )
 PAIR_RE = re.compile(
     r"Pair\s*:\s*\$?([A-Za-z0-9]+)(?:\s*[/\-]\s*([A-Za-z0-9]+))?",
     re.I,
 )
-ENTRY_RE = re.compile(r"Entry\s*:\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+ENTRY_RE = re.compile(
+    r"Entry(?:\s+limit)?\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+    re.I,
+)
 SL_RE = re.compile(r"Stop\s*loss\s*:\s*([0-9]+(?:\.[0-9]+)?)", re.I)
 TF_RE = re.compile(r"Time\s*frame\s*:\s*(\S+)", re.I)
 KNOWN_QUOTES = ("USDT", "USDC", "BTC", "ETH")
@@ -77,6 +84,7 @@ def parse(text: str) -> Signal | None:
         leverage=LEVERAGE,
         take_profit=tp,
         stop_loss=sl,
+        # Chart TF only — no window_start/window_end (unlike dex_vip WIB window).
         timeframe_raw=tf_m.group(1) if tf_m else None,
         has_signal=True,
         has_order_confirm=False,

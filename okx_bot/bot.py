@@ -298,6 +298,7 @@ def _register_bot_commands(
     session_started: float,
     exchange: str,
     cfg: dict,
+    watch_channels=None,
 ) -> None:
     @bot_client.on(events.NewMessage(pattern=r"^/status(@\w+)?$"))
     async def on_bot_command(event: events.NewMessage.Event) -> None:
@@ -469,6 +470,7 @@ def _register_bot_commands(
         session_started=session_started,
         exchange=exchange,
         cfg=cfg,
+        watch_channels=watch_channels,
     )
 
 async def _run_session(cfg: dict, secrets: dict) -> None:
@@ -566,6 +568,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             session_started=session_started,
             exchange=exchange,
             cfg=cfg,
+            watch_channels=watch_channels,
         )
 
         me = await client.get_me()
@@ -665,6 +668,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             if signal.is_expired:
                 msg = (
                     f"⏭ Signal expired, skip\n"
+                    f"Channel: {src.key}\n"
                     f"Pair: {signal.pair}\n"
                     f"Side: {signal.side}\n"
                     f"Entry: {signal.entry}\n"
@@ -693,8 +697,12 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
 
             order_id = None
             trade_id = None
+            # Cryptocium posts limit entries (incl. "Entry limit"); never follow env market.
+            order_kwargs = {"order_type": "limit"} if src.parser == "cryptocium" else {}
             try:
-                order = await _run_sync(active_trader.place_order, signal)
+                order = await _run_sync(
+                    active_trader.place_order, signal, **order_kwargs
+                )
                 order_id = order.get("id") or order.get("info", {}).get("ordId")
                 try:
                     trade_id = await _run_sync(
@@ -719,6 +727,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     logger.exception("Failed to persist trade")
                 msg = (
                     f"✅ Order {'(dry-run) ' if dry_run else ''}berhasil\n"
+                    f"Channel: {src.key} ({src.name})\n"
                     f"Pair: {signal.pair} → {signal.swap_symbol}\n"
                     f"Side: {signal.side}\n"
                     f"Entry: {signal.entry}\n"
@@ -741,6 +750,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     )
                 msg = (
                     f"❌ Order gagal\n"
+                    f"Channel: {src.key} ({src.name})\n"
                     f"Pair: {signal.pair}\n"
                     f"Side: {signal.side}\n"
                     f"Entry: {signal.entry}\n"

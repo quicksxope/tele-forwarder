@@ -35,6 +35,7 @@ class TradeRow:
     window_start: str | None
     window_end: str | None
     timeframe_raw: str | None
+    channel_key: str | None = None
 
 
 class TradeStore:
@@ -87,10 +88,15 @@ class TradeStore:
                     ON trades(source, closed_at);
                 """
             )
+            # Lightweight migration for older local DBs.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            if "channel_key" not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN channel_key TEXT")
 
     def add_trade(self, **fields: Any) -> int:
         cols = {
             "source": fields.get("source", "live"),
+            "channel_key": fields.get("channel_key"),
             "pair": fields["pair"],
             "symbol": fields["symbol"],
             "side": fields["side"],
@@ -156,6 +162,7 @@ class TradeStore:
         *,
         source: str | None = None,
         closed_only: bool = True,
+        channel_key: str | None = None,
     ) -> list[TradeRow]:
         q = """
             SELECT * FROM trades
@@ -166,6 +173,9 @@ class TradeStore:
         if source:
             q += " AND source=?"
             params.append(source)
+        if channel_key:
+            q += " AND channel_key=?"
+            params.append(channel_key)
         if closed_only:
             q += " AND closed_at IS NOT NULL AND status != 'open'"
         q += " ORDER BY COALESCE(closed_at, opened_at)"
@@ -185,12 +195,21 @@ class TradeStore:
             ).fetchone()
         return float(row["equity"]) if row else None
 
-    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+    def list_open_trades(
+        self,
+        *,
+        source: str | None = "live",
+        limit: int = 20,
+        channel_key: str | None = None,
+    ) -> list[TradeRow]:
         q = "SELECT * FROM trades WHERE status='open'"
         params: list[Any] = []
         if source:
             q += " AND source=?"
             params.append(source)
+        if channel_key:
+            q += " AND channel_key=?"
+            params.append(channel_key)
         q += " ORDER BY opened_at DESC LIMIT ?"
         params.append(limit)
         with self._connect() as conn:
@@ -199,6 +218,7 @@ class TradeStore:
 
     @staticmethod
     def _row(r: sqlite3.Row) -> TradeRow:
+        keys = r.keys()
         return TradeRow(
             id=r["id"],
             source=r["source"],
@@ -221,4 +241,5 @@ class TradeStore:
             window_start=r["window_start"],
             window_end=r["window_end"],
             timeframe_raw=r["timeframe_raw"],
+            channel_key=r["channel_key"] if "channel_key" in keys else None,
         )
