@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Protocol
 
 import ccxt
@@ -21,6 +22,49 @@ def _binance_load_markets(exchange: ccxt.Exchange) -> None:
     if exchange.markets:
         return
     exchange.load_markets()
+
+
+def _normalize_positions(raw: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Normalize CCXT fetch_positions() rows to a common shape."""
+    out: list[dict[str, Any]] = []
+    for p in raw or []:
+        try:
+            contracts = float(p.get("contracts") or 0)
+        except (TypeError, ValueError):
+            contracts = 0.0
+        if abs(contracts) < 1e-12:
+            try:
+                notional = float(p.get("notional") or 0)
+            except (TypeError, ValueError):
+                notional = 0.0
+            if abs(notional) < 1e-12:
+                continue
+        side = (p.get("side") or "").lower() or "net"
+        entry = p.get("entryPrice")
+        mark = p.get("markPrice")
+        upnl = p.get("unrealizedPnl")
+        lev = p.get("leverage")
+        symbol = p.get("symbol") or "?"
+        out.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "contracts": contracts,
+                "entry": float(entry) if entry is not None else None,
+                "mark": float(mark) if mark is not None else None,
+                "unrealized_pnl": float(upnl) if upnl is not None else None,
+                "leverage": float(lev) if lev is not None else None,
+                "notional": (
+                    float(p["notional"]) if p.get("notional") is not None else None
+                ),
+                "liquidation": (
+                    float(p["liquidationPrice"])
+                    if p.get("liquidationPrice") is not None
+                    else None
+                ),
+            }
+        )
+    return out
 
 
 class Trader(Protocol):
@@ -378,45 +422,7 @@ class OkxTrader:
     def fetch_open_positions(self) -> list[dict[str, Any]]:
         """Return non-zero OKX swap positions (normalized)."""
         self.exchange.load_markets()
-        raw = self.exchange.fetch_positions()
-        out: list[dict[str, Any]] = []
-        for p in raw or []:
-            try:
-                contracts = float(p.get("contracts") or 0)
-            except (TypeError, ValueError):
-                contracts = 0.0
-            if abs(contracts) < 1e-12:
-                # some venues use 'contractSize' / info; also check notional
-                try:
-                    notional = float(p.get("notional") or 0)
-                except (TypeError, ValueError):
-                    notional = 0.0
-                if abs(notional) < 1e-12:
-                    continue
-            side = (p.get("side") or "").lower() or "net"
-            entry = p.get("entryPrice")
-            mark = p.get("markPrice")
-            upnl = p.get("unrealizedPnl")
-            lev = p.get("leverage")
-            symbol = p.get("symbol") or "?"
-            out.append(
-                {
-                    "symbol": symbol,
-                    "side": side,
-                    "contracts": contracts,
-                    "entry": float(entry) if entry is not None else None,
-                    "mark": float(mark) if mark is not None else None,
-                    "unrealized_pnl": float(upnl) if upnl is not None else None,
-                    "leverage": float(lev) if lev is not None else None,
-                    "notional": float(p["notional"]) if p.get("notional") is not None else None,
-                    "liquidation": (
-                        float(p["liquidationPrice"])
-                        if p.get("liquidationPrice") is not None
-                        else None
-                    ),
-                }
-            )
-        return out
+        return _normalize_positions(self.exchange.fetch_positions())
 
 
 class BybitTrader:
@@ -784,6 +790,43 @@ class BinanceTrader:
             return {"dry_run": True, "id": order_id, "status": "open"}
         _binance_load_markets(self.exchange)
         return self.exchange.fetch_order(order_id, symbol)
+
+    def fetch_open_positions(self) -> list[dict[str, Any]]:
+        """Return non-zero Binance USDT-M positions (normalized)."""
+        if self.dry_run:
+            return []
+        _binance_load_markets(self.exchange)
+        return _normalize_positions(self.exchange.fetch_positions())
+
+    def fetch_realized_pnl(self, *, days: int = 7) -> dict[str, Any]:
+        """Sum REALIZED_PNL income from Binance futures over the last N days."""
+        if self.dry_run:
+            return {"days": days, "total": 0.0, "by_symbol": {}, "count": 0}
+        _binance_load_markets(self.exchange)
+        since_ms = int((time.time() - max(1, days) * 86400) * 1000)
+        rows = self.exchange.fapiPrivateGetIncome(
+            {
+                "incomeType": "REALIZED_PNL",
+                "startTime": since_ms,
+                "limit": 1000,
+            }
+        )
+        total = 0.0
+        by_symbol: dict[str, float] = {}
+        for r in rows or []:
+            try:
+                income = float(r.get("income") or 0)
+            except (TypeError, ValueError):
+                continue
+            total += income
+            sym = str(r.get("symbol") or "?")
+            by_symbol[sym] = by_symbol.get(sym, 0.0) + income
+        return {
+            "days": days,
+            "total": total,
+            "by_symbol": by_symbol,
+            "count": len(rows or []),
+        }
 
 
 def make_trader(cfg: dict) -> Trader:

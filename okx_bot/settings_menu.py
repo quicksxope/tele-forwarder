@@ -246,45 +246,66 @@ def _norm_sym(s: str | None) -> str:
     return s.replace(":USDT", "").replace("-SWAP", "").replace("-", "/").upper()
 
 
-def _positions_text(store, trader, *, channel_key: str | None = None) -> str:
-    """OKX live positions + DB open-trade match (OKX-first)."""
-    exch = getattr(trader, "exchange_name", "").lower()
-    if exch != "okx" or not hasattr(trader, "fetch_open_positions"):
+def _positions_text(
+    store,
+    traders: list[tuple[str, Any]],
+    *,
+    channel_key: str | None = None,
+) -> str:
+    """Live positions from enabled venues + DB open-trade match."""
+    if not traders:
         return (
             "📍 Active positions\n\n"
-            "Saat ini hanya OKX yang didukung.\n"
-            f"Trader aktif: {exch or '?'}."
+            "Tidak ada venue aktif / key kosong.\n"
+            "Buka /settings → Venue ON/OFF atau Set API Key."
         )
 
-    sandbox = getattr(trader, "sandbox", False)
-    mode = "sandbox" if sandbox else "live"
     scope = "All" if not channel_key else channel_key
-    lines = [f"📍 Active positions · OKX ({mode}) · {scope}\n"]
-
-    try:
-        positions = trader.fetch_open_positions()
-    except Exception as e:
-        return f"📍 Active positions\n\n⚠️ Gagal fetch OKX: {type(e).__name__}: {e}"
+    lines = [f"📍 Active positions · {scope}\n"]
+    total_upnl = 0.0
+    any_upnl = False
 
     db_opens = []
     if hasattr(store, "list_open_trades"):
         try:
-            db_opens = store.list_open_trades(source="live", limit=50, channel_key=channel_key)
+            db_opens = store.list_open_trades(
+                source="live", limit=50, channel_key=channel_key
+            )
         except Exception as e:
             lines.append(f"⚠️ DB open trades: {type(e).__name__}: {e}\n")
 
-    by_sym: dict[str, list] = {}
-    for t in db_opens:
-        key = _norm_sym(t.symbol or t.pair)
-        by_sym.setdefault(key, []).append(t)
-
     matched_ids: set[int] = set()
-    shown = 0
-    if not positions:
-        lines.append("Tidak ada posisi terbuka di OKX.")
-    else:
-        if channel_key is None:
-            lines.append(f"OKX open: {len(positions)}\n")
+
+    for ex_name, trader in traders:
+        if not hasattr(trader, "fetch_open_positions"):
+            lines.append(f"—— {ex_name.upper()} ——\n(tidak support fetch positions)\n")
+            continue
+        sandbox = getattr(trader, "sandbox", False)
+        demo = getattr(trader, "demo", False)
+        mode = "demo" if demo else ("sandbox" if sandbox else "live")
+        try:
+            positions = trader.fetch_open_positions()
+        except Exception as e:
+            lines.append(
+                f"—— {ex_name.upper()} ({mode}) ——\n"
+                f"⚠️ Gagal fetch: {type(e).__name__}: {e}\n"
+            )
+            continue
+
+        by_sym: dict[str, list] = {}
+        for t in db_opens:
+            t_ex = (getattr(t, "exchange", None) or "").lower()
+            if t_ex and t_ex != ex_name.lower():
+                continue
+            key = _norm_sym(t.symbol or t.pair)
+            by_sym.setdefault(key, []).append(t)
+
+        lines.append(f"—— {ex_name.upper()} ({mode}) · open {len(positions)} ——")
+        if not positions:
+            lines.append("Tidak ada posisi terbuka.\n")
+            continue
+
+        shown = 0
         for p in positions:
             key = _norm_sym(p.get("symbol"))
             hits = by_sym.get(key) or []
@@ -297,13 +318,18 @@ def _positions_text(store, trader, *, channel_key: str | None = None) -> str:
             upnl = p.get("unrealized_pnl")
             lev = p.get("leverage")
             contracts = p.get("contracts")
+            notional = p.get("notional")
             entry_s = f"{entry:.6g}" if entry is not None else "?"
             mark_s = f"{mark:.6g}" if mark is not None else "?"
             upnl_s = f"{upnl:+.4f}" if upnl is not None else "?"
             lev_s = f"{lev:g}x" if lev is not None else "?"
+            notional_s = f"{abs(notional):.2f}" if notional is not None else "?"
+            if upnl is not None:
+                total_upnl += float(upnl)
+                any_upnl = True
             lines.append(
                 f"{shown}. {p.get('symbol')}\n"
-                f"   {side} · size {contracts} · lev {lev_s}\n"
+                f"   {side} · size {contracts} · lev {lev_s} · notional {notional_s}\n"
                 f"   entry {entry_s} · mark {mark_s}\n"
                 f"   uPnL {upnl_s} USDT"
             )
@@ -321,15 +347,19 @@ def _positions_text(store, trader, *, channel_key: str | None = None) -> str:
                 lines.append("   DB: (tidak ada open trade cocok)")
             lines.append("")
         if channel_key and shown == 0:
-            lines.append(f"Tidak ada posisi OKX yang match channel `{channel_key}`.")
+            lines.append(f"Tidak ada posisi yang match channel `{channel_key}`.\n")
+
+    if any_upnl:
+        lines.append(f"Σ unrealized PnL: {total_upnl:+.4f} USDT")
 
     stale = [t for t in db_opens if t.id not in matched_ids]
     if stale:
-        lines.append(f"DB stale (open di DB, tidak di OKX): {len(stale)}")
+        lines.append(f"\nDB stale (open di DB, tidak di exchange): {len(stale)}")
         for t in stale[:8]:
             ch = _channel_label(getattr(t, "channel_key", None))
+            ex = (getattr(t, "exchange", None) or "?").upper()
             lines.append(
-                f"• #{t.id} [{ch}] {t.pair} {(t.side or '').upper()} @ {t.entry} "
+                f"• #{t.id} [{ch}/{ex}] {t.pair} {(t.side or '').upper()} @ {t.entry} "
                 f"(order {t.order_id or '-'})"
             )
         if len(stale) > 8:
@@ -338,23 +368,69 @@ def _positions_text(store, trader, *, channel_key: str | None = None) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _pnl_text(store, *, channel_key: str | None = None) -> str:
+def _live_pnl_header(traders: list[tuple[str, Any]]) -> str:
+    """Unrealized from open positions + Binance realized income when available."""
+    chunks: list[str] = []
+    for ex_name, trader in traders:
+        sandbox = getattr(trader, "sandbox", False)
+        demo = getattr(trader, "demo", False)
+        mode = "demo" if demo else ("sandbox" if sandbox else "live")
+        part = [f"Live · {ex_name.upper()} ({mode})"]
+        if hasattr(trader, "fetch_open_positions"):
+            try:
+                positions = trader.fetch_open_positions()
+                upnl = 0.0
+                for p in positions:
+                    if p.get("unrealized_pnl") is not None:
+                        upnl += float(p["unrealized_pnl"])
+                part.append(f"Open pos: {len(positions)} · uPnL {upnl:+.4f} USDT")
+            except Exception as e:
+                part.append(f"uPnL: ⚠️ {type(e).__name__}: {e}")
+        if hasattr(trader, "fetch_realized_pnl"):
+            try:
+                r7 = trader.fetch_realized_pnl(days=7)
+                r30 = trader.fetch_realized_pnl(days=30)
+                part.append(
+                    f"Exchange realized 7d: {r7['total']:+.4f} USDT "
+                    f"({r7['count']} fills)"
+                )
+                part.append(
+                    f"Exchange realized 30d: {r30['total']:+.4f} USDT "
+                    f"({r30['count']} fills)"
+                )
+            except Exception as e:
+                part.append(f"Realized: ⚠️ {type(e).__name__}: {e}")
+        chunks.append("\n".join(part))
+    return "\n\n".join(chunks) if chunks else ""
+
+
+def _pnl_text(
+    store,
+    *,
+    channel_key: str | None = None,
+    traders: list[tuple[str, Any]] | None = None,
+) -> str:
     scope = "All" if not channel_key else channel_key
+    live = ""
+    if traders and channel_key is None:
+        live = _live_pnl_header(traders)
+        if live:
+            live = f"{live}\n\n————\n\n"
     text_7 = _period_metrics_text(
         store,
         weeks=1,
         source="live",
-        title=f"PnL · 7 hari · {scope}",
+        title=f"PnL · 7 hari · {scope} (DB closed trades)",
         channel_key=channel_key,
     )
     text_30 = _period_metrics_text(
         store,
         weeks=4,
         source="live",
-        title=f"PnL · 30 hari · {scope}",
+        title=f"PnL · 30 hari · {scope} (DB closed trades)",
         channel_key=channel_key,
     )
-    return f"{text_7}\n\n————\n\n{text_30}"
+    return f"{live}{text_7}\n\n————\n\n{text_30}"
 
 
 def _roi_text(store, *, channel_key: str | None = None) -> str:
@@ -474,9 +550,23 @@ def register_settings_menu(
     cfg: dict,
     watch_channels=None,
     rt_path=None,
+    resolve_traders=None,
 ) -> None:
-    """Register /settings, callback buttons, and wizard reply handlers."""
+    """Register /settings, callback buttons, and wizard reply handlers.
+
+    resolve_traders: optional callable () -> list[(exchange_name, trader)]
+    for live Positions / PnL across enabled venues.
+    """
     channels = list(watch_channels or [channel])
+
+    def _traders_for_live() -> list[tuple[str, Any]]:
+        if resolve_traders is not None:
+            try:
+                return list(resolve_traders() or [])
+            except Exception:
+                logger.exception("resolve_traders failed")
+        name = getattr(trader, "exchange_name", exchange) or exchange
+        return [(str(name).lower(), trader)]
 
     async def _show_main(event, *, edit: bool = False) -> None:
         text = _menu_text(
@@ -643,9 +733,10 @@ def register_settings_menu(
         if data.startswith("pos:"):
             key = data.split(":", 1)[1]
             channel_key = None if key == "all" else key
-            await event.edit("⏳ Loading OKX positions…")
+            await event.edit("⏳ Loading positions…")
+            traders = await asyncio.to_thread(_traders_for_live)
             text = await asyncio.to_thread(
-                _positions_text, store, trader, channel_key=channel_key
+                _positions_text, store, traders, channel_key=channel_key
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"
@@ -663,7 +754,12 @@ def register_settings_menu(
             key = data.split(":", 1)[1]
             channel_key = None if key == "all" else key
             await event.edit("⏳ Loading PnL…")
-            text = await asyncio.to_thread(_pnl_text, store, channel_key=channel_key)
+            traders = await asyncio.to_thread(_traders_for_live)
+            text = await asyncio.to_thread(
+                _pnl_text, store, channel_key=channel_key, traders=traders
+            )
+            if len(text) > 4000:
+                text = text[:3990] + "\n…"
             await event.edit(text, buttons=_back_keyboard())
             return
 

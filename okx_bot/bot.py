@@ -603,6 +603,9 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             cfg=cfg,
             watch_channels=watch_channels,
             rt_path=rt_path,
+            resolve_traders=lambda: _resolve_order_traders(
+                store, owner_id, cfg, rt_path=rt_path
+            ),
         )
 
         _register_bot_commands(
