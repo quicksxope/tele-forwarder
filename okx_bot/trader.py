@@ -39,6 +39,31 @@ class Trader(Protocol):
     def fetch_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
 
 
+def _finalize_amount(
+    exchange: ccxt.Exchange, symbol: str, raw: float, *, dry_run: bool
+) -> float:
+    """Round to market precision and bump up to exchange minimum lot size."""
+    if dry_run:
+        return round(raw, 8)
+    exchange.load_markets()
+    amount = float(exchange.amount_to_precision(symbol, raw))
+    market = exchange.market(symbol)
+    min_amt = ((market.get("limits") or {}).get("amount") or {}).get("min")
+    if min_amt is not None:
+        min_f = float(min_amt)
+        if amount < min_f:
+            logger.info(
+                "Amount %s below min %s for %s — using minimum",
+                amount,
+                min_f,
+                symbol,
+            )
+            amount = float(exchange.amount_to_precision(symbol, min_f))
+            if amount < min_f:
+                amount = min_f
+    return amount
+
+
 def _resolve_amount(
     exchange: ccxt.Exchange,
     *,
@@ -53,40 +78,38 @@ def _resolve_amount(
 ) -> float:
     """Fixed amount, or % of USDT equity when equity_pct > 0."""
     if equity_pct <= 0:
-        return amount
-
-    if dry_run:
-        equity = equity_dry_usdt
+        raw = amount
     else:
-        bal = exchange.fetch_balance()
-        usdt = bal.get("USDT") or {}
-        equity = None
-        for key in ("total", "free"):
-            val = usdt.get(key)
-            if val is not None and float(val) > 0:
-                equity = float(val)
-                break
-        if equity is None:
-            total = bal.get("total") or {}
-            if "USDT" in total:
-                equity = float(total["USDT"])
-        if equity is None:
-            raise ValueError(f"No USDT balance found on {exchange_label}")
+        if dry_run:
+            equity = equity_dry_usdt
+        else:
+            bal = exchange.fetch_balance()
+            usdt = bal.get("USDT") or {}
+            equity = None
+            for key in ("total", "free"):
+                val = usdt.get(key)
+                if val is not None and float(val) > 0:
+                    equity = float(val)
+                    break
+            if equity is None:
+                total = bal.get("total") or {}
+                if "USDT" in total:
+                    equity = float(total["USDT"])
+            if equity is None:
+                raise ValueError(f"No USDT balance found on {exchange_label}")
 
-    margin = equity * (equity_pct / 100.0)
-    notional = margin * leverage
-    raw = notional / signal.entry
-    logger.info(
-        "Size from equity: %.2f USDT × %.1f%% × %sx / %s = %s",
-        equity,
-        equity_pct,
-        leverage,
-        signal.entry,
-        raw,
-    )
-    if dry_run:
-        return round(raw, 8)
-    return float(exchange.amount_to_precision(symbol, raw))
+        margin = equity * (equity_pct / 100.0)
+        notional = margin * leverage
+        raw = notional / signal.entry
+        logger.info(
+            "Size from equity: %.2f USDT × %.1f%% × %sx / %s = %s",
+            equity,
+            equity_pct,
+            leverage,
+            signal.entry,
+            raw,
+        )
+    return _finalize_amount(exchange, symbol, raw, dry_run=dry_run)
 
 
 class OkxTrader:
