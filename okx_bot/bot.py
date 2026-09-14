@@ -797,6 +797,11 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                         f"✅ {ex_name.upper()}{dry_tag}\n"
                         f"Amount: {order.get('amount', active_trader.amount)}\n"
                         f"Order ID: {order_id or '-'}"
+                        + (
+                            f"\n{order['protective_note']}"
+                            if order.get("protective_note")
+                            else ""
+                        )
                     )
                     if order_id and (signal.window_end or signal.valid_until):
                         cancel_jobs.append((active_trader, str(order_id)))

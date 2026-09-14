@@ -39,6 +39,58 @@ class Trader(Protocol):
     def fetch_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
 
 
+def _order_filled_qty(order: dict[str, Any]) -> float:
+    filled = order.get("filled")
+    if filled is not None:
+        try:
+            qty = float(filled)
+            if qty > 0:
+                return qty
+        except (TypeError, ValueError):
+            pass
+    info = order.get("info") or {}
+    for key in ("executedQty", "cumQty"):
+        raw = info.get(key)
+        if raw is not None and str(raw) not in ("", "0"):
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def _fetch_mark_price(exchange: ccxt.Exchange, symbol: str) -> float | None:
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+    except Exception:
+        return None
+    for key in ("mark", "last", "close"):
+        val = ticker.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _binance_exit_trigger_valid(
+    *, entry_side: str, mark: float, trigger: float, kind: str
+) -> bool:
+    """Return False if a STOP/TAKE_PROFIT would fire immediately (Binance -2021)."""
+    if mark <= 0 or trigger <= 0:
+        return True
+    closing_buy = entry_side == "sell"
+    if kind == "sl":
+        if closing_buy:
+            return trigger > mark
+        return trigger < mark
+    # take profit
+    if closing_buy:
+        return trigger < mark
+    return trigger > mark
+
+
 def _market_min_amount(exchange: ccxt.Exchange, symbol: str) -> float:
     """Minimum order size in base/contracts (limits + precision step)."""
     market = exchange.market(symbol)
@@ -557,11 +609,72 @@ class BinanceTrader:
         params: dict[str, Any] = {}
         if self.position_mode == "long_short":
             params["positionSide"] = "LONG" if signal.side == "buy" else "SHORT"
-        if signal.take_profit is not None:
-            params["takeProfitPrice"] = signal.take_profit
-        if signal.stop_loss is not None:
-            params["stopLossPrice"] = signal.stop_loss
+        # Do not pass takeProfitPrice/stopLossPrice on entry: CCXT turns LIMIT+SL into
+        # a STOP order and Binance returns -2021 when the stop would trigger immediately.
         return params
+
+    def _position_side_params(self, entry_side: str) -> dict[str, Any]:
+        if self.position_mode != "long_short":
+            return {}
+        return {
+            "positionSide": "LONG" if entry_side == "buy" else "SHORT",
+        }
+
+    def _place_binance_protective_orders(
+        self,
+        symbol: str,
+        signal: Signal,
+        amount: float,
+    ) -> str:
+        """Place reduce-only TP/SL after entry fill. Returns a short status note."""
+        if signal.take_profit is None and signal.stop_loss is None:
+            return ""
+        close_side = "buy" if signal.side == "sell" else "sell"
+        base_params: dict[str, Any] = {
+            "reduceOnly": True,
+            "workingType": "MARK_PRICE",
+            **self._position_side_params(signal.side),
+        }
+        mark = _fetch_mark_price(self.exchange, symbol)
+        placed: list[str] = []
+        skipped: list[str] = []
+
+        def _place(kind: str, otype: str, trigger: float) -> None:
+            if mark is not None and not _binance_exit_trigger_valid(
+                entry_side=signal.side,
+                mark=mark,
+                trigger=trigger,
+                kind=kind,
+            ):
+                skipped.append(kind.upper())
+                return
+            stop = float(self.exchange.price_to_precision(symbol, trigger))
+            try:
+                self.exchange.create_order(
+                    symbol,
+                    otype,
+                    close_side,
+                    amount,
+                    None,
+                    {**base_params, "stopPrice": stop},
+                )
+                placed.append(kind.upper())
+            except Exception as e:
+                logger.warning("Binance %s order failed: %s", kind, e)
+                skipped.append(f"{kind.upper()}({e})")
+
+        if signal.stop_loss is not None:
+            _place("sl", "STOP_MARKET", signal.stop_loss)
+        if signal.take_profit is not None:
+            _place("tp", "TAKE_PROFIT_MARKET", signal.take_profit)
+
+        if placed and not skipped:
+            return f"TP/SL: {', '.join(placed)} placed"
+        if placed:
+            return f"TP/SL: {', '.join(placed)}; skipped {', '.join(skipped)}"
+        if skipped:
+            return f"TP/SL not placed ({', '.join(skipped)})"
+        return ""
 
     def ensure_leverage(self, symbol: str, leverage: int) -> None:
         try:
@@ -628,12 +741,20 @@ class BinanceTrader:
         logger.info("Order payload: %s dry_run=%s", payload, self.dry_run)
 
         if self.dry_run:
-            return {"dry_run": True, "id": "DRY_RUN", **payload}
+            note = ""
+            if signal.take_profit is not None or signal.stop_loss is not None:
+                note = "TP/SL: on Binance, placed after entry fill (not on entry ticket)"
+            return {
+                "dry_run": True,
+                "id": "DRY_RUN",
+                "protective_note": note,
+                **payload,
+            }
 
         self.ensure_position_mode()
         self.ensure_margin_mode(symbol, leverage)
         self.ensure_leverage(symbol, leverage)
-        return self.exchange.create_order(
+        order = self.exchange.create_order(
             symbol,
             otype,
             signal.side,
@@ -641,6 +762,16 @@ class BinanceTrader:
             price,
             params,
         )
+        filled = _order_filled_qty(order)
+        if filled > 0:
+            order["protective_note"] = self._place_binance_protective_orders(
+                symbol, signal, filled
+            )
+        elif signal.take_profit is not None or signal.stop_loss is not None:
+            order["protective_note"] = (
+                "TP/SL pending — entry limit still open (Binance sets exits after fill)"
+            )
+        return order
 
     def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
         if self.dry_run or order_id == "DRY_RUN":
