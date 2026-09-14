@@ -815,12 +815,23 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                         )
                     result_lines.append(f"❌ {ex_name.upper()}\nError: {err}")
 
+            lev = signal.leverage or "-"
+            size_rule = ""
+            if order_traders:
+                _t = order_traders[0][1]
+                if _t.equity_pct > 0:
+                    size_rule = (
+                        f"Size: {_t.equity_pct}% USDT equity (margin) × {lev}x notional\n"
+                    )
+                else:
+                    size_rule = f"Size: fixed {_t.amount} (base coin)\n"
             header = (
                 f"📤 Order results — {src.key}\n"
                 f"Pair: {signal.pair} → {signal.swap_symbol}\n"
                 f"Side: {signal.side} @ {signal.entry}\n"
                 f"TP: {signal.take_profit or '-'} SL: {signal.stop_loss or '-'}\n"
-                f"Leverage: {signal.leverage or '-'}x\n\n"
+                f"Leverage: {lev}x\n"
+                f"{size_rule}\n"
             )
             msg = header + "\n\n".join(result_lines)
             if signal.window_end or signal.valid_until:
