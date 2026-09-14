@@ -563,6 +563,12 @@ class BinanceTrader:
 def make_trader(cfg: dict) -> Trader:
     """Build OKX, Bybit, or Binance trader from env/config dict."""
     exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
+    return make_trader_for_exchange(cfg, exchange)
+
+
+def make_trader_for_exchange(cfg: dict, exchange: str) -> Trader:
+    """Build one trader for the given exchange using env keys for that venue."""
+    exchange = exchange.lower().strip()
     dry_run = cfg.get("TRADE_DRY_RUN", "true").lower() in ("1", "true", "yes")
     common = {
         "margin_mode": cfg.get("TRADE_MARGIN_MODE", "cross"),

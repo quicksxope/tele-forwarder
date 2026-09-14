@@ -11,6 +11,12 @@ from typing import Any
 from telethon import Button, TelegramClient, events
 
 from .crypto import decrypt, encrypt
+from .exchange_runtime import (
+    SUPPORTED_EXCHANGES,
+    format_enabled_line,
+    load_enabled,
+    toggle_exchange,
+)
 from .metrics import compute_metrics
 from .trader import BinanceTrader, BybitTrader, OkxTrader
 from .weekly_report import period_bounds
@@ -46,7 +52,25 @@ def _main_keyboard() -> list[list[Any]]:
         [Button.inline("🔑 Set API Key", b"menu:set")],
         [Button.inline("📋 My Keys", b"menu:list"), Button.inline("🗑 Delete Key", b"menu:del")],
         [Button.inline("🔌 Test Connection", b"menu:test"), Button.inline("📊 Status", b"menu:status")],
+        [Button.inline("⚙️ Venue ON/OFF", b"menu:venues")],
     ]
+
+
+def _venues_keyboard(rt_path, cfg: dict) -> list[list[Any]]:
+    state = load_enabled(rt_path, cfg=cfg)
+    rows: list[list[Any]] = []
+    row: list[Any] = []
+    for ex in SUPPORTED_EXCHANGES:
+        on = state.get(ex, False)
+        label = f"{'🟢' if on else '⚫'} {ex.upper()}"
+        row.append(Button.inline(label, f"venue:toggle:{ex}".encode()))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([Button.inline("« Menu", b"menu:main"), Button.inline("✕ Cancel", b"menu:cancel")])
+    return rows
 
 
 def _back_keyboard() -> list[list[Any]]:
@@ -79,7 +103,7 @@ def _clear_wizard(uid: int) -> None:
     _wizards.pop(uid, None)
 
 
-def _menu_text(*, channel, signal_chat: int, dry_run: bool, sandbox: bool, exchange: str, watch_channels=None) -> str:
+def _menu_text(*, channel, signal_chat: int, dry_run: bool, sandbox: bool, exchange: str, watch_channels=None, rt_path=None, cfg: dict | None = None) -> str:
     mode = "dry-run" if dry_run else "live"
     venue = "sandbox/testnet" if sandbox else "production"
     watch_lines = ""
@@ -89,15 +113,19 @@ def _menu_text(*, channel, signal_chat: int, dry_run: bool, sandbox: bool, excha
             tag = "parse" if c.parse_only else "trade"
             parts.append(f"{c.key}[{tag}]")
         watch_lines = f"Watch: {', '.join(parts)}\n"
+    runtime_line = ""
+    if rt_path is not None and cfg is not None:
+        runtime_line = format_enabled_line(rt_path, cfg=cfg) + "\n"
     return (
-        f"🤖 {exchange.upper()} Signal Bot\n\n"
+        f"🤖 Signal Bot (multi-venue)\n\n"
         f"Active profile: {channel.name}\n"
         f"Parser: {channel.parser}\n"
         f"{watch_lines}"
         f"Signal chat (active): {signal_chat}\n"
-        f"Exchange (default): {exchange}\n"
+        f"Legacy EXCHANGE env: {exchange}\n"
+        f"{runtime_line}"
         f"Trading: {mode} ({venue})\n\n"
-        "Menu: Assets · Positions · PnL · ROI (filter per channel)\n"
+        "Menu: Venue ON/OFF · Assets · PnL · API keys\n"
         "Hanya owner · private chat saja."
     )
 
@@ -445,6 +473,7 @@ def register_settings_menu(
     exchange: str,
     cfg: dict,
     watch_channels=None,
+    rt_path=None,
 ) -> None:
     """Register /settings, callback buttons, and wizard reply handlers."""
     channels = list(watch_channels or [channel])
@@ -457,6 +486,8 @@ def register_settings_menu(
             sandbox=sandbox,
             exchange=exchange,
             watch_channels=channels,
+            rt_path=rt_path,
+            cfg=cfg,
         )
         buttons = _main_keyboard()
         if edit and hasattr(event, "edit"):
@@ -651,6 +682,33 @@ def register_settings_menu(
             await event.edit(text, buttons=_back_keyboard())
             return
 
+        if data == "menu:venues":
+            await event.edit(
+                "Pilih venue — 🟢 = order aktif, ⚫ = mati (parse tetap jalan):\n\n"
+                + (format_enabled_line(rt_path, cfg=cfg) if rt_path else ""),
+                buttons=_venues_keyboard(rt_path, cfg) if rt_path else _back_keyboard(),
+            )
+            return
+
+        if data.startswith("venue:toggle:"):
+            if rt_path is None:
+                await event.answer("Runtime path missing", alert=True)
+                return
+            exch = data.split(":", 2)[2]
+            if exch not in SUPPORTED_EXCHANGES:
+                return
+            state = await asyncio.to_thread(
+                toggle_exchange, rt_path, exch, cfg=cfg, owner_id=owner_id
+            )
+            on = state.get(exch, False)
+            await event.answer(f"{exch.upper()} {'ON' if on else 'OFF'}")
+            await event.edit(
+                "Pilih venue — 🟢 = order aktif, ⚫ = mati:\n\n"
+                + format_enabled_line(rt_path, cfg=cfg),
+                buttons=_venues_keyboard(rt_path, cfg),
+            )
+            return
+
         if data == "menu:status":
             uptime_s = int(time.monotonic() - session_started)
             h, rem = divmod(uptime_s, 3600)
@@ -664,7 +722,7 @@ def register_settings_menu(
                 f"Uptime: {h}h {m}m {s}s\n"
                 f"Active profile: {channel.key} ({channel.name})\n"
                 f"Watch: {watch}\n"
-                f"Exchange: {exchange}\n"
+                f"{format_enabled_line(rt_path, cfg=cfg) if rt_path else f'Exchange: {exchange}'}\n"
                 f"TRADE_DRY_RUN: {dry_run}\n"
                 f"Sandbox/testnet: {sandbox}\n"
                 f"Store: {store_name}\n"

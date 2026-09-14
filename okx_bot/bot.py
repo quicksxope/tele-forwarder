@@ -13,10 +13,17 @@ from telethon import TelegramClient, events
 
 from .channels import get_active_channel, list_enabled_channels, match_channel
 from .crypto import decrypt, encrypt
+from .exchange_runtime import (
+    enabled_exchange_names,
+    format_enabled_line,
+    load_enabled,
+    runtime_path,
+    toggle_exchange,
+)
 from .parser import Signal
 from .settings_menu import register_settings_menu
 from .supabase_store import make_store
-from .trader import BinanceTrader, BybitTrader, OkxTrader, Trader, make_trader, required_credentials
+from .trader import BinanceTrader, BybitTrader, OkxTrader, Trader, make_trader, make_trader_for_exchange, required_credentials
 
 logging.basicConfig(
     level=logging.INFO,
@@ -231,11 +238,11 @@ async def _cmd_status(
     )
 
 
-def _load_user_trader(store, telegram_id: int, cfg: dict) -> Trader | None:
-    """Load and decrypt per-user credentials from DB, return a Trader or None."""
-    if cfg.get("PREFER_DB_CREDENTIALS", "true").lower() not in ("1", "true", "yes"):
-        return None
-    exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
+def _load_trader_for_exchange(
+    store, telegram_id: int, cfg: dict, exchange: str
+) -> Trader | None:
+    """Load trader for one exchange (DB credentials or env for that venue)."""
+    exchange = exchange.lower().strip()
     dry_run = cfg.get("TRADE_DRY_RUN", "true").lower() in ("1", "true", "yes")
     common = {
         "margin_mode": cfg.get("TRADE_MARGIN_MODE", "cross"),
@@ -247,51 +254,74 @@ def _load_user_trader(store, telegram_id: int, cfg: dict) -> Trader | None:
         "position_mode": cfg.get("TRADE_POSITION_MODE", "net"),
         "dry_run": dry_run,
     }
-    if not hasattr(store, "load_credentials"):
-        return None
+    prefer_db = cfg.get("PREFER_DB_CREDENTIALS", "true").lower() in ("1", "true", "yes")
+    if prefer_db and hasattr(store, "load_credentials"):
+        try:
+            row = store.load_credentials(telegram_id, exchange)
+        except Exception as e:
+            logger.warning(
+                "load_credentials failed for %s user %s (%s)",
+                exchange,
+                telegram_id,
+                e,
+            )
+            row = None
+        if row:
+            try:
+                api_key = decrypt(row["api_key_enc"])
+                secret = decrypt(row["secret_enc"])
+                extra = decrypt(row["extra_enc"]) if row.get("extra_enc") else ""
+            except Exception:
+                logger.exception("Failed to decrypt credentials for %s", exchange)
+                return None
+            if exchange == "bybit":
+                return BybitTrader(
+                    api_key=api_key,
+                    secret=secret,
+                    sandbox=row.get("sandbox", False),
+                    demo=row.get("demo", False),
+                    **common,
+                )
+            if exchange == "binance":
+                return BinanceTrader(
+                    api_key=api_key,
+                    secret=secret,
+                    sandbox=row.get("sandbox", False),
+                    demo=row.get("demo", False),
+                    **common,
+                )
+            return OkxTrader(
+                api_key=api_key,
+                secret=secret,
+                password=extra,
+                sandbox=row.get("sandbox", False),
+                **common,
+            )
     try:
-        row = store.load_credentials(telegram_id, exchange)
-    except Exception as e:
-        # Table missing / RLS / network — fall back to env trader
-        logger.warning(
-            "load_credentials failed for user %s (%s); using env trader",
-            telegram_id,
-            e,
-        )
-        return None
-    if not row:
-        return None
-    try:
-        api_key = decrypt(row["api_key_enc"])
-        secret = decrypt(row["secret_enc"])
-        extra = decrypt(row["extra_enc"]) if row.get("extra_enc") else ""
-    except Exception:
-        logger.exception("Failed to decrypt credentials for user %s", telegram_id)
+        return make_trader_for_exchange(cfg, exchange)
+    except ValueError:
         return None
 
-    if exchange == "bybit":
-        return BybitTrader(
-            api_key=api_key,
-            secret=secret,
-            sandbox=row.get("sandbox", False),
-            demo=row.get("demo", False),
-            **common,
-        )
-    if exchange == "binance":
-        return BinanceTrader(
-            api_key=api_key,
-            secret=secret,
-            sandbox=row.get("sandbox", False),
-            demo=row.get("demo", False),
-            **common,
-        )
-    return OkxTrader(
-        api_key=api_key,
-        secret=secret,
-        password=extra,
-        sandbox=row.get("sandbox", False),
-        **common,
-    )
+
+def _load_user_trader(store, telegram_id: int, cfg: dict) -> Trader | None:
+    """Legacy: trader for EXCHANGE env only."""
+    exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
+    return _load_trader_for_exchange(store, telegram_id, cfg, exchange)
+
+
+def _resolve_order_traders(
+    store, telegram_id: int, cfg: dict, *, rt_path: Path
+) -> list[tuple[str, Trader]]:
+    """All enabled exchanges that have a usable trader."""
+    enabled = enabled_exchange_names(rt_path, cfg=cfg)
+    out: list[tuple[str, Trader]] = []
+    for ex in enabled:
+        t = _load_trader_for_exchange(store, telegram_id, cfg, ex)
+        if t is None:
+            logger.warning("Exchange %s enabled but no credentials/env keys", ex)
+            continue
+        out.append((ex, t))
+    return out
 
 
 def _register_bot_commands(
@@ -469,20 +499,6 @@ def _register_bot_commands(
             lines.append(f"• {exch} — {mode}")
         await event.respond("\n".join(lines))
 
-    register_settings_menu(
-        bot_client,
-        owner_id=owner_id,
-        channel=channel,
-        signal_chat=signal_chat,
-        dry_run=dry_run,
-        sandbox=sandbox,
-        store=store,
-        trader=trader,
-        session_started=session_started,
-        exchange=exchange,
-        cfg=cfg,
-        watch_channels=watch_channels,
-    )
 
 async def _run_session(cfg: dict, secrets: dict) -> None:
     """One Telethon connection lifecycle — never reuse client across loops."""
@@ -515,9 +531,15 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
 
     dry_run = cfg.get("TRADE_DRY_RUN", "true").lower() in ("1", "true", "yes")
     exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
+    rt_path = runtime_path(DATA)
+    load_enabled(rt_path, cfg=cfg)
     missing = required_credentials(cfg, dry_run=dry_run)
-    if missing:
-        raise SystemExit(f"Missing env for live trading on {exchange}: {', '.join(missing)}")
+    if missing and not dry_run:
+        logger.warning(
+            "Env missing for legacy EXCHANGE=%s: %s — per-venue keys / DB may still work",
+            exchange,
+            ", ".join(missing),
+        )
 
     trader = make_trader(cfg)
     sandbox = trader.sandbox
@@ -567,6 +589,22 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             logger.info("Using bot session — bot must be member of signal group")
             bot_client = client
 
+        register_settings_menu(
+            bot_client,
+            owner_id=owner_id,
+            channel=channel,
+            signal_chat=signal_chat,
+            dry_run=dry_run,
+            sandbox=sandbox,
+            store=store,
+            trader=trader,
+            session_started=session_started,
+            exchange=exchange,
+            cfg=cfg,
+            watch_channels=watch_channels,
+            rt_path=rt_path,
+        )
+
         _register_bot_commands(
             bot_client,
             owner_id=owner_id,
@@ -584,12 +622,10 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
 
         me = await client.get_me()
         logger.info(
-            "Logged in as %s | exchange=%s | dry_run=%s | sandbox=%s | parse_only=%s | watch=%s",
+            "Logged in as %s | dry_run=%s | enabled=%s | watch=%s",
             me.id,
-            exchange,
             dry_run,
-            sandbox,
-            cfg.get("SIGNAL_PARSE_ONLY", "false"),
+            enabled_exchange_names(rt_path, cfg=cfg),
             watch_chats,
         )
         notify_client = bot_client if bot_client is not None else client
@@ -698,75 +734,82 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     )
                 return
 
-            # Allow test runs to force .env credentials by disabling DB preference.
-            active_trader = await _run_sync(_load_user_trader, store, owner_id, cfg) or trader
-            logger.info(
-                "Using trader: %s (per-user=%s)",
-                active_trader.exchange_name,
-                active_trader is not trader,
+            order_traders = await _run_sync(
+                _resolve_order_traders, store, owner_id, cfg, rt_path=rt_path
             )
+            if not order_traders:
+                await _dm(
+                    "⏸ Tidak ada venue aktif / key kosong.\n"
+                    f"{format_enabled_line(rt_path, cfg=cfg)}\n"
+                    "Buka /settings → Venue ON/OFF"
+                )
+                return
 
-            order_id = None
-            trade_id = None
-            # Cryptocium posts limit entries (incl. "Entry limit"); never follow env market.
             order_kwargs = {"order_type": "limit"} if src.parser == "cryptocium" else {}
-            try:
-                order = await _run_sync(
-                    active_trader.place_order, signal, **order_kwargs
-                )
-                order_id = order.get("id") or order.get("info", {}).get("ordId")
+            result_lines: list[str] = []
+            trade_ids: list[int] = []
+            cancel_jobs: list[tuple[Trader, str]] = []
+
+            for ex_name, active_trader in order_traders:
+                logger.info("Placing order on %s", ex_name)
                 try:
-                    trade_id = await _run_sync(
-                        store.add_trade,
-                        source="live",
-                        channel_key=src.key,
-                        pair=signal.pair,
-                        symbol=signal.swap_symbol,
-                        side=signal.side,
-                        entry=signal.entry,
-                        leverage=signal.leverage,
-                        take_profit=signal.take_profit,
-                        stop_loss=signal.stop_loss,
-                        amount=order.get("amount", trader.amount),
-                        status="open",
-                        order_id=str(order_id) if order_id else None,
-                        window_start=signal.window_start,
-                        window_end=signal.window_end or signal.valid_until,
-                        timeframe_raw=signal.timeframe_raw,
+                    order = await _run_sync(
+                        active_trader.place_order, signal, **order_kwargs
                     )
-                except Exception:
-                    logger.exception("Failed to persist trade")
-                msg = (
-                    f"✅ Order {'(dry-run) ' if dry_run else ''}berhasil\n"
-                    f"Channel: {src.key} ({src.name})\n"
-                    f"Pair: {signal.pair} → {signal.swap_symbol}\n"
-                    f"Side: {signal.side}\n"
-                    f"Entry: {signal.entry}\n"
-                    f"Leverage: {signal.leverage or '-'}x\n"
-                    f"TP: {signal.take_profit or '-'}\n"
-                    f"SL: {signal.stop_loss or '-'}\n"
-                    f"Timeframe: {signal.timeframe_raw or '-'}\n"
-                    f"Amount: {order.get('amount', trader.amount)}\n"
-                    f"Order ID: {order_id}"
-                )
-                if signal.window_end or signal.valid_until:
-                    msg += "\n⏳ Auto-cancel saat window habis"
-            except Exception as e:
-                logger.exception("Order failed")
-                err = str(e)
-                if "SSL" in err or "CERTIFICATE" in err or "NetworkError" in type(e).__name__:
-                    err = (
-                        f"Network/SSL ke {exchange.upper()} gagal (sering karena Telkomsel Internet Baik). "
-                        "Pakai VPN / WiFi lain / VPS."
+                    order_id = order.get("id") or (order.get("info") or {}).get("ordId")
+                    trade_id = None
+                    try:
+                        trade_id = await _run_sync(
+                            store.add_trade,
+                            source="live",
+                            channel_key=src.key,
+                            exchange=ex_name,
+                            pair=signal.pair,
+                            symbol=signal.swap_symbol,
+                            side=signal.side,
+                            entry=signal.entry,
+                            leverage=signal.leverage,
+                            take_profit=signal.take_profit,
+                            stop_loss=signal.stop_loss,
+                            amount=order.get("amount", active_trader.amount),
+                            status="open",
+                            order_id=str(order_id) if order_id else None,
+                            window_start=signal.window_start,
+                            window_end=signal.window_end or signal.valid_until,
+                            timeframe_raw=signal.timeframe_raw,
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist trade for %s", ex_name)
+                    if trade_id:
+                        trade_ids.append(trade_id)
+                    dry_tag = " (dry-run)" if dry_run else ""
+                    result_lines.append(
+                        f"✅ {ex_name.upper()}{dry_tag}\n"
+                        f"Amount: {order.get('amount', active_trader.amount)}\n"
+                        f"Order ID: {order_id or '-'}"
                     )
-                msg = (
-                    f"❌ Order gagal\n"
-                    f"Channel: {src.key} ({src.name})\n"
-                    f"Pair: {signal.pair}\n"
-                    f"Side: {signal.side}\n"
-                    f"Entry: {signal.entry}\n"
-                    f"Error: {err}"
-                )
+                    if order_id and (signal.window_end or signal.valid_until):
+                        cancel_jobs.append((active_trader, str(order_id)))
+                except Exception as e:
+                    logger.exception("Order failed on %s", ex_name)
+                    err = str(e)
+                    if "SSL" in err or "CERTIFICATE" in err or "NetworkError" in type(e).__name__:
+                        err = (
+                            f"Network/SSL ke {ex_name.upper()} gagal. "
+                            "Pakai VPN / WiFi lain / VPS."
+                        )
+                    result_lines.append(f"❌ {ex_name.upper()}\nError: {err}")
+
+            header = (
+                f"📤 Order results — {src.key}\n"
+                f"Pair: {signal.pair} → {signal.swap_symbol}\n"
+                f"Side: {signal.side} @ {signal.entry}\n"
+                f"TP: {signal.take_profit or '-'} SL: {signal.stop_loss or '-'}\n"
+                f"Leverage: {signal.leverage or '-'}x\n\n"
+            )
+            msg = header + "\n\n".join(result_lines)
+            if signal.window_end or signal.valid_until:
+                msg += "\n\n⏳ Auto-cancel saat window habis (per venue)"
 
             if hasattr(store, "add_signal_event"):
                 await _run_sync(
@@ -776,12 +819,12 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     chat_id=src_chat,
                     message_id=event.id,
                     parsed=True,
-                    trade_id=trade_id,
+                    trade_id=trade_ids[0] if trade_ids else None,
                 )
 
             await _dm(msg)
 
-            if order_id and (signal.window_end or signal.valid_until):
+            for active_trader, order_id in cancel_jobs:
                 _track(
                     asyncio.create_task(
                         _cancel_when_window_ends(
@@ -789,12 +832,13 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                             trader=active_trader,
                             store=store,
                             notif_chat=notif_chat,
-                            order_id=str(order_id),
+                            order_id=order_id,
                             symbol=signal.swap_symbol,
                             signal=signal,
                         )
                     )
                 )
+            return
 
         print(f"Listening for signals in {watch_chats} (Ctrl+C to stop)")
         if bot_client is not client:

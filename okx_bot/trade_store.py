@@ -92,11 +92,14 @@ class TradeStore:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
             if "channel_key" not in cols:
                 conn.execute("ALTER TABLE trades ADD COLUMN channel_key TEXT")
+            if "exchange" not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN exchange TEXT")
 
     def add_trade(self, **fields: Any) -> int:
         cols = {
             "source": fields.get("source", "live"),
             "channel_key": fields.get("channel_key"),
+            "exchange": fields.get("exchange"),
             "pair": fields["pair"],
             "symbol": fields["symbol"],
             "side": fields["side"],
