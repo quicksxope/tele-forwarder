@@ -19,7 +19,7 @@ PAIR_RE = re.compile(
     re.I,
 )
 ENTRY_RE = re.compile(
-    r"Entry(?:\s+limit)?\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+    r"Entry(?:\s+limit)?\s*:?\s*([0-9]+(?:\.[0-9]+)?)",
     re.I,
 )
 SL_RE = re.compile(r"Stop\s*loss\s*:\s*([0-9]+(?:\.[0-9]+)?)", re.I)

@@ -642,6 +642,16 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             topic = _message_topic_id(event.message)
             src = match_channel(watch_channels, src_chat, topic)
             if src is None:
+                for c in watch_channels:
+                    if c.chat_id == src_chat and c.topic_id is not None:
+                        logger.debug(
+                            "Ignore msg %s chat=%s topic=%s (want topic=%s for %s)",
+                            event.id,
+                            src_chat,
+                            topic,
+                            c.topic_id,
+                            c.key,
+                        )
                 return
             text = event.raw_text or ""
             if src.parser == "cryptocium" and "SETUP" not in text.upper():

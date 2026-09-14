@@ -110,6 +110,16 @@ def test_cryptocium_swing_entry_limit():
     assert s.timeframe_raw == "30m"
 
 
+def test_cryptocium_entry_limit_no_colon():
+    text = """☄️ SETUP - LONG-buy
+🔘 Pair : $BTC
+🟡 Entry limit 77310
+🔴 Stop loss : 76350"""
+    s = parse_signal(text, parser="cryptocium")
+    assert s is not None
+    assert s.entry == 77310.0
+
+
 if __name__ == "__main__":
     test_legacy_confirm_block()
     test_dex_vip_format()

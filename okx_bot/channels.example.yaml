@@ -20,7 +20,7 @@ channels:
   cryptocium:
     name: "Cryptocium SETUP"
     chat_id: -1003751705288
-    topic_id: 12160
+    topic_id: 2
     parser: cryptocium
     enabled: true
     # false = trade together with dex_vip on the same OKX account
