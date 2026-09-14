@@ -39,6 +39,21 @@ class Trader(Protocol):
     def fetch_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
 
 
+def _market_min_amount(exchange: ccxt.Exchange, symbol: str) -> float:
+    """Minimum order size in base/contracts (limits + precision step)."""
+    market = exchange.market(symbol)
+    candidates: list[float] = []
+    min_amt = ((market.get("limits") or {}).get("amount") or {}).get("min")
+    if min_amt is not None:
+        candidates.append(float(min_amt))
+    prec = (market.get("precision") or {}).get("amount")
+    if prec is not None:
+        pf = float(prec)
+        if pf > 0:
+            candidates.append(pf)
+    return max(candidates) if candidates else 0.0
+
+
 def _finalize_amount(
     exchange: ccxt.Exchange, symbol: str, raw: float, *, dry_run: bool
 ) -> float:
@@ -46,21 +61,20 @@ def _finalize_amount(
     if dry_run:
         return round(raw, 8)
     exchange.load_markets()
+    min_f = _market_min_amount(exchange, symbol)
+    if min_f > 0 and raw < min_f:
+        logger.info(
+            "Amount %s below min %s for %s — using minimum",
+            raw,
+            min_f,
+            symbol,
+        )
+        raw = min_f
     amount = float(exchange.amount_to_precision(symbol, raw))
-    market = exchange.market(symbol)
-    min_amt = ((market.get("limits") or {}).get("amount") or {}).get("min")
-    if min_amt is not None:
-        min_f = float(min_amt)
+    if min_f > 0 and amount < min_f:
+        amount = float(exchange.amount_to_precision(symbol, min_f))
         if amount < min_f:
-            logger.info(
-                "Amount %s below min %s for %s — using minimum",
-                amount,
-                min_f,
-                symbol,
-            )
-            amount = float(exchange.amount_to_precision(symbol, min_f))
-            if amount < min_f:
-                amount = min_f
+            amount = min_f
     return amount
 
 
