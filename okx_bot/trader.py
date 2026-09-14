@@ -1,4 +1,4 @@
-"""Exchange trading via CCXT (OKX, Bybit)."""
+"""Exchange trading via CCXT (OKX, Bybit, Binance)."""
 from __future__ import annotations
 
 import logging
@@ -9,6 +9,18 @@ import ccxt
 from .parser import Signal
 
 logger = logging.getLogger(__name__)
+
+# USDT-M only — skip spot/inverse on load_markets (demo spot host often breaks).
+_BINANCE_CCXT_OPTIONS = {
+    "defaultType": "future",
+    "fetchMarkets": ["linear"],
+}
+
+
+def _binance_load_markets(exchange: ccxt.Exchange) -> None:
+    if exchange.markets:
+        return
+    exchange.load_markets()
 
 
 class Trader(Protocol):
@@ -397,8 +409,159 @@ class BybitTrader:
         return self.exchange.fetch_order(order_id, symbol)
 
 
+class BinanceTrader:
+    exchange_name = "binance"
+
+    def __init__(
+        self,
+        api_key: str,
+        secret: str,
+        *,
+        sandbox: bool = False,
+        demo: bool = False,
+        default_type: str = "future",
+        margin_mode: str = "cross",
+        leverage: int = 5,
+        amount: float = 1.0,
+        equity_pct: float = 0.0,
+        equity_dry_usdt: float = 5000.0,
+        order_type: str = "limit",
+        position_mode: str = "net",  # net | long_short
+        dry_run: bool = True,
+    ) -> None:
+        self.sandbox = sandbox
+        self.demo = demo
+        self.margin_mode = margin_mode
+        self.default_leverage = leverage
+        self.amount = amount
+        self.equity_pct = equity_pct
+        self.equity_dry_usdt = equity_dry_usdt
+        self.order_type = order_type
+        self.position_mode = position_mode
+        self.dry_run = dry_run
+
+        opts = dict(_BINANCE_CCXT_OPTIONS)
+        if default_type != "future":
+            opts["defaultType"] = default_type
+        self.exchange = ccxt.binance(
+            {
+                "apiKey": api_key,
+                "secret": secret,
+                "enableRateLimit": True,
+                "options": opts,
+            }
+        )
+        if demo and sandbox:
+            raise ValueError("BINANCE_DEMO and BINANCE_SANDBOX are mutually exclusive")
+        if demo:
+            self.exchange.enable_demo_trading(True)
+        elif sandbox:
+            self.exchange.set_sandbox_mode(True)
+
+    def _params(self, signal: Signal) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if self.position_mode == "long_short":
+            params["positionSide"] = "LONG" if signal.side == "buy" else "SHORT"
+        if signal.take_profit is not None:
+            params["takeProfitPrice"] = signal.take_profit
+        if signal.stop_loss is not None:
+            params["stopLossPrice"] = signal.stop_loss
+        return params
+
+    def ensure_leverage(self, symbol: str, leverage: int) -> None:
+        try:
+            self.exchange.set_leverage(leverage, symbol)
+        except Exception as e:
+            logger.warning("set_leverage failed (continuing): %s", e)
+
+    def ensure_margin_mode(self, symbol: str, leverage: int) -> None:
+        try:
+            self.exchange.set_margin_mode(
+                self.margin_mode,
+                symbol,
+                {"leverage": leverage},
+            )
+        except Exception as e:
+            logger.warning("set_margin_mode failed (continuing): %s", e)
+
+    def ensure_position_mode(self) -> None:
+        if self.position_mode != "long_short":
+            return
+        try:
+            self.exchange.set_position_mode(True)
+        except Exception as e:
+            logger.warning("set_position_mode failed (continuing): %s", e)
+
+    def resolve_amount(self, signal: Signal, *, leverage: int, symbol: str) -> float:
+        return _resolve_amount(
+            self.exchange,
+            dry_run=self.dry_run,
+            equity_pct=self.equity_pct,
+            amount=self.amount,
+            equity_dry_usdt=self.equity_dry_usdt,
+            signal=signal,
+            leverage=leverage,
+            symbol=symbol,
+            exchange_label="Binance",
+        )
+
+    def place_order(
+        self, signal: Signal, *, order_type: str | None = None
+    ) -> dict[str, Any]:
+        symbol = signal.swap_symbol
+        leverage = signal.leverage or self.default_leverage
+        params = self._params(signal)
+        otype = order_type or self.order_type
+        price = signal.entry if otype == "limit" else None
+
+        if not self.dry_run:
+            _binance_load_markets(self.exchange)
+            if symbol not in self.exchange.markets:
+                raise ValueError(f"Market not found on Binance: {symbol}")
+
+        amount = self.resolve_amount(signal, leverage=leverage, symbol=symbol)
+
+        payload = {
+            "symbol": symbol,
+            "type": otype,
+            "side": signal.side,
+            "amount": amount,
+            "price": price,
+            "leverage": leverage,
+            "params": params,
+        }
+        logger.info("Order payload: %s dry_run=%s", payload, self.dry_run)
+
+        if self.dry_run:
+            return {"dry_run": True, "id": "DRY_RUN", **payload}
+
+        self.ensure_position_mode()
+        self.ensure_margin_mode(symbol, leverage)
+        self.ensure_leverage(symbol, leverage)
+        return self.exchange.create_order(
+            symbol,
+            otype,
+            signal.side,
+            amount,
+            price,
+            params,
+        )
+
+    def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
+        if self.dry_run or order_id == "DRY_RUN":
+            return {"dry_run": True, "id": order_id, "status": "canceled"}
+        _binance_load_markets(self.exchange)
+        return self.exchange.cancel_order(order_id, symbol)
+
+    def fetch_order(self, order_id: str, symbol: str) -> dict[str, Any]:
+        if self.dry_run or order_id == "DRY_RUN":
+            return {"dry_run": True, "id": order_id, "status": "open"}
+        _binance_load_markets(self.exchange)
+        return self.exchange.fetch_order(order_id, symbol)
+
+
 def make_trader(cfg: dict) -> Trader:
-    """Build OKX or Bybit trader from env/config dict."""
+    """Build OKX, Bybit, or Binance trader from env/config dict."""
     exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
     dry_run = cfg.get("TRADE_DRY_RUN", "true").lower() in ("1", "true", "yes")
     common = {
@@ -425,6 +588,19 @@ def make_trader(cfg: dict) -> Trader:
             **common,
         )
 
+    if exchange == "binance":
+        demo = cfg.get("BINANCE_DEMO", "false").lower() in ("1", "true", "yes")
+        sandbox = cfg.get("BINANCE_SANDBOX", "false").lower() in ("1", "true", "yes")
+        if demo and sandbox:
+            raise ValueError("BINANCE_DEMO and BINANCE_SANDBOX are mutually exclusive")
+        return BinanceTrader(
+            api_key=cfg.get("BINANCE_API_KEY", ""),
+            secret=cfg.get("BINANCE_SECRET", ""),
+            sandbox=sandbox,
+            demo=demo,
+            **common,
+        )
+
     if exchange == "okx":
         return OkxTrader(
             api_key=cfg.get("OKX_API_KEY", ""),
@@ -434,7 +610,7 @@ def make_trader(cfg: dict) -> Trader:
             **common,
         )
 
-    raise ValueError(f"Unknown EXCHANGE={exchange!r} — use okx or bybit")
+    raise ValueError(f"Unknown EXCHANGE={exchange!r} — use okx, bybit, or binance")
 
 
 def required_credentials(cfg: dict, *, dry_run: bool) -> list[str]:
@@ -444,4 +620,6 @@ def required_credentials(cfg: dict, *, dry_run: bool) -> list[str]:
     exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
     if exchange == "bybit":
         return [k for k in ("BYBIT_API_KEY", "BYBIT_SECRET") if not cfg.get(k)]
+    if exchange == "binance":
+        return [k for k in ("BINANCE_API_KEY", "BINANCE_SECRET") if not cfg.get(k)]
     return [k for k in ("OKX_API_KEY", "OKX_SECRET", "OKX_PASSWORD") if not cfg.get(k)]

@@ -16,7 +16,7 @@ from .crypto import decrypt, encrypt
 from .parser import Signal
 from .settings_menu import register_settings_menu
 from .supabase_store import make_store
-from .trader import OkxTrader, BybitTrader, Trader, make_trader, required_credentials
+from .trader import BinanceTrader, BybitTrader, OkxTrader, Trader, make_trader, required_credentials
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +66,7 @@ def _cfg() -> dict:
             (
                 "OKX_",
                 "BYBIT_",
+                "BINANCE_",
                 "EXCHANGE",
                 "TELEGRAM_",
                 "SIGNAL_",
@@ -276,6 +277,14 @@ def _load_user_trader(store, telegram_id: int, cfg: dict) -> Trader | None:
             demo=row.get("demo", False),
             **common,
         )
+    if exchange == "binance":
+        return BinanceTrader(
+            api_key=api_key,
+            secret=secret,
+            sandbox=row.get("sandbox", False),
+            demo=row.get("demo", False),
+            **common,
+        )
     return OkxTrader(
         api_key=api_key,
         secret=secret,
@@ -348,13 +357,15 @@ def _register_bot_commands(
                 "Lebih mudah: /settings → 🔑 Set API Key\n\n"
                 "OKX: `/setkey okx API_KEY SECRET PASSWORD`\n"
                 "Bybit: `/setkey bybit API_KEY SECRET`\n"
-                "Bybit demo: `/setkey bybit API_KEY SECRET --demo`",
+                "Bybit demo: `/setkey bybit API_KEY SECRET --demo`\n"
+                "Binance: `/setkey binance API_KEY SECRET`\n"
+                "Binance demo: `/setkey binance API_KEY SECRET --demo`",
             )
             return
 
         exch = parts[1].lower()
-        if exch not in ("okx", "bybit"):
-            await event.respond("❌ Exchange harus `okx` atau `bybit`.")
+        if exch not in ("okx", "bybit", "binance"):
+            await event.respond("❌ Exchange harus `okx`, `bybit`, atau `binance`.")
             return
 
         api_key_plain = parts[2]
@@ -368,7 +379,7 @@ def _register_bot_commands(
                 await event.respond("❌ OKX butuh PASSWORD (passphrase). `/setkey okx KEY SECRET PASSWORD`")
                 return
             extra_plain = parts[4]
-        elif exch == "bybit":
+        elif exch in ("bybit", "binance"):
             flags = [p.lower() for p in parts[4:]]
             if "--demo" in flags:
                 is_demo = True
@@ -418,11 +429,11 @@ def _register_bot_commands(
             return
         parts = event.raw_text.strip().split()
         if len(parts) < 2:
-            await event.respond("❌ Format: `/delkey okx` atau `/delkey bybit`")
+            await event.respond("❌ Format: `/delkey okx` atau `/delkey bybit` atau `/delkey binance`")
             return
         exch = parts[1].lower()
-        if exch not in ("okx", "bybit"):
-            await event.respond("❌ Exchange harus `okx` atau `bybit`.")
+        if exch not in ("okx", "bybit", "binance"):
+            await event.respond("❌ Exchange harus `okx`, `bybit`, atau `binance`.")
             return
         if not hasattr(store, "delete_credentials"):
             await event.respond("❌ Store tidak support hapus credentials.")

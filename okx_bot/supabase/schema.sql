@@ -148,7 +148,7 @@ comment on table public.signal_events is 'Raw Telegram signals audit log';
 create table if not exists public.user_credentials (
   id           bigserial primary key,
   telegram_id  bigint not null,
-  exchange     text not null check (exchange in ('okx', 'bybit')),
+  exchange     text not null check (exchange in ('okx', 'bybit', 'binance')),
   api_key_enc  text not null,   -- Fernet-encrypted API key
   secret_enc   text not null,   -- Fernet-encrypted API secret
   extra_enc    text,            -- Fernet-encrypted passphrase (OKX) or empty (Bybit)

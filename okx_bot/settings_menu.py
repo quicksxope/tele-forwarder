@@ -12,7 +12,7 @@ from telethon import Button, TelegramClient, events
 
 from .crypto import decrypt, encrypt
 from .metrics import compute_metrics
-from .trader import BybitTrader, OkxTrader
+from .trader import BinanceTrader, BybitTrader, OkxTrader
 from .weekly_report import period_bounds
 
 logger = logging.getLogger("okx_bot.settings")
@@ -55,7 +55,11 @@ def _back_keyboard() -> list[list[Any]]:
 
 def _exchange_keyboard(prefix: str) -> list[list[Any]]:
     return [
-        [Button.inline("OKX", f"{prefix}:okx".encode()), Button.inline("Bybit", f"{prefix}:bybit".encode())],
+        [
+            Button.inline("OKX", f"{prefix}:okx".encode()),
+            Button.inline("Bybit", f"{prefix}:bybit".encode()),
+        ],
+        [Button.inline("Binance", f"{prefix}:binance".encode())],
         [Button.inline("« Menu", b"menu:main"), Button.inline("✕ Cancel", b"menu:cancel")],
     ]
 
@@ -65,7 +69,7 @@ def _mode_keyboard(exchange: str) -> list[list[Any]]:
         [Button.inline("🟢 Live", b"mode:live")],
         [Button.inline("🟡 Sandbox / Testnet", b"mode:sandbox")],
     ]
-    if exchange == "bybit":
+    if exchange in ("bybit", "binance"):
         rows.append([Button.inline("🔵 Demo Trading", b"mode:demo")])
     rows.append([Button.inline("« Menu", b"menu:main"), Button.inline("✕ Cancel", b"menu:cancel")])
     return rows
@@ -403,6 +407,14 @@ def test_exchange_connection(
             demo=demo,
             **common,
         )
+    elif exchange == "binance":
+        trader = BinanceTrader(
+            api_key=api_key,
+            secret=secret,
+            sandbox=sandbox,
+            demo=demo,
+            **common,
+        )
     else:
         trader = OkxTrader(
             api_key=api_key,
@@ -668,7 +680,7 @@ def register_settings_menu(
 
         if data.startswith("set:"):
             exch = data.split(":", 1)[1]
-            if exch not in ("okx", "bybit"):
+            if exch not in ("okx", "bybit", "binance"):
                 return
             _wizards[owner_id] = WizardState(step="mode", exchange=exch)
             await event.edit(
@@ -703,7 +715,7 @@ def register_settings_menu(
 
         if data.startswith("del:"):
             exch = data.split(":", 1)[1]
-            if exch not in ("okx", "bybit"):
+            if exch not in ("okx", "bybit", "binance"):
                 return
             if not hasattr(store, "delete_credentials"):
                 await event.edit("❌ Store tidak support hapus credentials.", buttons=_back_keyboard())
@@ -722,7 +734,7 @@ def register_settings_menu(
 
         if data.startswith("test:"):
             exch = data.split(":", 1)[1]
-            if exch not in ("okx", "bybit") or not hasattr(store, "load_credentials"):
+            if exch not in ("okx", "bybit", "binance") or not hasattr(store, "load_credentials"):
                 await event.edit("❌ Tidak bisa test.", buttons=_back_keyboard())
                 return
             row = await asyncio.to_thread(store.load_credentials, owner_id, exch)
