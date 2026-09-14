@@ -433,21 +433,100 @@ def _pnl_text(
     return f"{live}{text_7}\n\n————\n\n{text_30}"
 
 
-def _roi_text(store, *, channel_key: str | None = None) -> str:
-    """ROI-focused view from equity snapshots + trade PnL (same metrics engine)."""
+def _trader_usdt_equity(trader) -> float | None:
+    """Best-effort USDT wallet equity from CCXT balance."""
+    try:
+        bal = trader.exchange.fetch_balance()
+    except Exception:
+        return None
+    usdt = bal.get("USDT") or {}
+    for key in ("total", "free"):
+        val = usdt.get(key)
+        if val is not None:
+            try:
+                f = float(val)
+                if f > 0:
+                    return f
+            except (TypeError, ValueError):
+                continue
+    total = bal.get("total") or {}
+    if "USDT" in total:
+        try:
+            return float(total["USDT"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _sum_live_equity(traders: list[tuple[str, Any]]) -> float | None:
+    total = 0.0
+    any_ok = False
+    for _, trader in traders:
+        eq = _trader_usdt_equity(trader)
+        if eq is not None:
+            total += eq
+            any_ok = True
+    return total if any_ok else None
+
+
+def _sum_realized_pnl(traders: list[tuple[str, Any]], *, days: int) -> float | None:
+    total = 0.0
+    any_ok = False
+    for _, trader in traders:
+        if not hasattr(trader, "fetch_realized_pnl"):
+            continue
+        try:
+            r = trader.fetch_realized_pnl(days=days)
+            total += float(r.get("total") or 0)
+            any_ok = True
+        except Exception:
+            continue
+    return total if any_ok else None
+
+
+def _roi_text(
+    store,
+    *,
+    channel_key: str | None = None,
+    traders: list[tuple[str, Any]] | None = None,
+) -> str:
+    """ROI from equity snapshots, live wallet, and/or closed-trade PnL."""
     scope = "All" if not channel_key else channel_key
     chunks: list[str] = []
+    traders = list(traders or [])
+
+    live_equity = _sum_live_equity(traders) if traders else None
+    if (
+        channel_key is None
+        and live_equity is not None
+        and hasattr(store, "snapshot_equity")
+    ):
+        try:
+            store.snapshot_equity(live_equity, source="live", note="roi_menu")
+        except Exception:
+            logger.exception("snapshot_equity failed")
+
     if channel_key:
         chunks.append(
-            f"ℹ️ Channel `{channel_key}`: ROI dari trade PnL saja "
-            "(wallet OKX shared, tidak di-split)."
+            f"ℹ️ Channel `{channel_key}`: ROI = PnL channel / equity wallet "
+            "(wallet shared antar channel)."
         )
+    if live_equity is not None:
+        venue = ", ".join(n.upper() for n, _ in traders) or "?"
+        chunks.append(f"Live equity · {venue}: {live_equity:.4f} USDT")
+
     for weeks, label in ((1, "7 hari"), (4, "30 hari")):
         start, end = period_bounds(weeks)
         equity_start = equity_end = None
+        estimated_start = False
+
         if channel_key is None and hasattr(store, "latest_equity_before"):
             equity_start = store.latest_equity_before(start, source="live")
             equity_end = store.latest_equity_before(end, source="live")
+
+        if channel_key is None and live_equity is not None:
+            equity_end = live_equity
+
         trades = (
             store.trades_between(
                 start, end, source="live", closed_only=True, channel_key=channel_key
@@ -455,6 +534,20 @@ def _roi_text(store, *, channel_key: str | None = None) -> str:
             if hasattr(store, "trades_between")
             else []
         )
+
+        if channel_key is None:
+            if equity_start is None and equity_end is not None and equity_end > 0:
+                days = weeks * 7
+                realized = _sum_realized_pnl(traders, days=days)
+                db_pnl = sum(float(t.pnl) for t in trades if t.pnl is not None)
+                delta = realized if realized is not None else db_pnl
+                equity_start = max(equity_end - delta, 1e-9)
+                estimated_start = True
+        elif live_equity is not None and live_equity > 0:
+            # Channel: ROI on wallet = channel closed PnL / current equity.
+            equity_start = live_equity
+            equity_end = None
+
         m = compute_metrics(
             trades,
             start=start,
@@ -462,9 +555,13 @@ def _roi_text(store, *, channel_key: str | None = None) -> str:
             equity_start=equity_start,
             equity_end=equity_end,
         )
+
         roi = f"{m.roi_pct:+.2f}%" if m.roi_pct is not None else "n/a"
         eq_s = f"{m.equity_start:.4f}" if m.equity_start is not None else "n/a"
         eq_e = f"{m.equity_end:.4f}" if m.equity_end is not None else "n/a"
+        note = ""
+        if estimated_start:
+            note = "\n(equity start diestimasi dari live − realized/PnL)"
         chunks.append(
             f"📉 ROI · {label} · {scope}\n"
             f"Period: {start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}\n"
@@ -473,6 +570,7 @@ def _roi_text(store, *, channel_key: str | None = None) -> str:
             f"ROI: {roi}\n"
             f"Total PnL (closed): {m.total_pnl:+.4f} USDT\n"
             f"Closed trades: {m.n_closed} (W{m.n_wins}/L{m.n_losses})"
+            f"{note}"
         )
     return "\n\n————\n\n".join(chunks)
 
@@ -774,7 +872,12 @@ def register_settings_menu(
             key = data.split(":", 1)[1]
             channel_key = None if key == "all" else key
             await event.edit("⏳ Loading ROI…")
-            text = await asyncio.to_thread(_roi_text, store, channel_key=channel_key)
+            traders = await asyncio.to_thread(_traders_for_live)
+            text = await asyncio.to_thread(
+                _roi_text, store, channel_key=channel_key, traders=traders
+            )
+            if len(text) > 4000:
+                text = text[:3990] + "\n…"
             await event.edit(text, buttons=_back_keyboard())
             return
 
