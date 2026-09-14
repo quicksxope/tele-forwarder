@@ -54,14 +54,51 @@ def _market_min_amount(exchange: ccxt.Exchange, symbol: str) -> float:
     return max(candidates) if candidates else 0.0
 
 
+def _market_min_cost(exchange: ccxt.Exchange, symbol: str) -> float:
+    """Minimum order notional (quote), e.g. Binance USDT-M min ~5 USDT."""
+    market = exchange.market(symbol)
+    min_cost = ((market.get("limits") or {}).get("cost") or {}).get("min")
+    if min_cost is not None:
+        return float(min_cost)
+    return 0.0
+
+
+def _amount_step(exchange: ccxt.Exchange, symbol: str, min_lot: float) -> float:
+    if min_lot > 0:
+        return min_lot
+    prec = (exchange.market(symbol).get("precision") or {}).get("amount")
+    if prec is not None:
+        pf = float(prec)
+        if pf > 0:
+            return pf
+    return 1e-8
+
+
 def _finalize_amount(
-    exchange: ccxt.Exchange, symbol: str, raw: float, *, dry_run: bool
+    exchange: ccxt.Exchange,
+    symbol: str,
+    raw: float,
+    *,
+    dry_run: bool,
+    price: float | None = None,
 ) -> float:
-    """Round to market precision and bump up to exchange minimum lot size."""
+    """Round to market precision; bump to min lot and min notional (quote)."""
     if dry_run:
         return round(raw, 8)
     exchange.load_markets()
     min_f = _market_min_amount(exchange, symbol)
+    min_cost = _market_min_cost(exchange, symbol)
+    if price and price > 0 and min_cost > 0:
+        need_amt = min_cost / price
+        if raw < need_amt:
+            logger.info(
+                "Amount %s below min notional %.2f USDT at price %s for %s",
+                raw,
+                min_cost,
+                price,
+                symbol,
+            )
+            raw = need_amt
     if min_f > 0 and raw < min_f:
         logger.info(
             "Amount %s below min %s for %s — using minimum",
@@ -69,12 +106,31 @@ def _finalize_amount(
             min_f,
             symbol,
         )
-        raw = min_f
+        raw = max(raw, min_f)
     amount = float(exchange.amount_to_precision(symbol, raw))
     if min_f > 0 and amount < min_f:
         amount = float(exchange.amount_to_precision(symbol, min_f))
         if amount < min_f:
             amount = min_f
+    if price and price > 0 and min_cost > 0:
+        notional = amount * price
+        if notional + 1e-12 < min_cost:
+            step = _amount_step(exchange, symbol, min_f)
+            raw = max(amount, min_cost / price)
+            for _ in range(64):
+                try:
+                    amount = float(exchange.amount_to_precision(symbol, raw))
+                except ccxt.InvalidOrder:
+                    amount = raw
+                if amount * price + 1e-12 >= min_cost:
+                    logger.info(
+                        "Raised size to %s for min notional %.2f USDT on %s",
+                        amount,
+                        min_cost,
+                        symbol,
+                    )
+                    break
+                raw += step
     return amount
 
 
@@ -123,7 +179,9 @@ def _resolve_amount(
             signal.entry,
             raw,
         )
-    return _finalize_amount(exchange, symbol, raw, dry_run=dry_run)
+    return _finalize_amount(
+        exchange, symbol, raw, dry_run=dry_run, price=signal.entry
+    )
 
 
 class OkxTrader:
