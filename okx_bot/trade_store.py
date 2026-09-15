@@ -35,6 +35,8 @@ class TradeRow:
     window_start: str | None
     window_end: str | None
     timeframe_raw: str | None
+    channel_key: str | None = None
+    exchange: str | None = None
 
 
 class TradeStore:
@@ -87,10 +89,18 @@ class TradeStore:
                     ON trades(source, closed_at);
                 """
             )
+            # Lightweight migration for older local DBs.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            if "channel_key" not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN channel_key TEXT")
+            if "exchange" not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN exchange TEXT")
 
     def add_trade(self, **fields: Any) -> int:
         cols = {
             "source": fields.get("source", "live"),
+            "channel_key": fields.get("channel_key"),
+            "exchange": fields.get("exchange"),
             "pair": fields["pair"],
             "symbol": fields["symbol"],
             "side": fields["side"],
@@ -137,9 +147,41 @@ class TradeStore:
                 """
                 UPDATE trades
                 SET status=?, exit_price=?, exit_reason=?, pnl=?, r_multiple=?, closed_at=?
-                WHERE id=?
+                WHERE id=? AND status='open'
                 """,
                 (status, exit_price, exit_reason, pnl, r_multiple, _utc_now(), trade_id),
+            )
+
+    def close_trade_by_order_id(
+        self,
+        order_id: str,
+        *,
+        status: str,
+        exit_reason: str,
+        exit_price: float | None = None,
+        pnl: float | None = None,
+        r_multiple: float | None = None,
+    ) -> None:
+        sets = ["status=?", "exit_reason=?", "closed_at=?"]
+        params: list[Any] = [status, exit_reason, _utc_now()]
+        if exit_price is not None:
+            sets.append("exit_price=?")
+            params.append(exit_price)
+        if pnl is not None:
+            sets.append("pnl=?")
+            params.append(pnl)
+        if r_multiple is not None:
+            sets.append("r_multiple=?")
+            params.append(r_multiple)
+        params.append(order_id)
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE trades
+                SET {', '.join(sets)}
+                WHERE order_id=? AND status='open'
+                """,
+                params,
             )
 
     def snapshot_equity(self, equity: float, *, source: str = "live", note: str = "") -> None:
@@ -156,6 +198,7 @@ class TradeStore:
         *,
         source: str | None = None,
         closed_only: bool = True,
+        channel_key: str | None = None,
     ) -> list[TradeRow]:
         q = """
             SELECT * FROM trades
@@ -166,6 +209,9 @@ class TradeStore:
         if source:
             q += " AND source=?"
             params.append(source)
+        if channel_key:
+            q += " AND channel_key=?"
+            params.append(channel_key)
         if closed_only:
             q += " AND closed_at IS NOT NULL AND status != 'open'"
         q += " ORDER BY COALESCE(closed_at, opened_at)"
@@ -185,12 +231,81 @@ class TradeStore:
             ).fetchone()
         return float(row["equity"]) if row else None
 
-    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+    def latest_equity_baseline(
+        self, *, source: str = "live", note_prefix: str = "roi_baseline"
+    ) -> tuple[datetime, float] | None:
+        """Most recent equity snapshot marked as ROI baseline (fresh start)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT equity, ts FROM equity_snapshots
+                WHERE source=? AND note LIKE ?
+                ORDER BY ts DESC LIMIT 1
+                """,
+                (source, f"{note_prefix}%"),
+            ).fetchone()
+        if not row:
+            return None
+        ts_raw = row["ts"]
+        if isinstance(ts_raw, str):
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        else:
+            ts = ts_raw
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc), float(row["equity"])
+
+    def reset_roi_baseline(
+        self,
+        equity: float,
+        *,
+        source: str = "live",
+        close_open_trades: bool = True,
+        clear_prior_snapshots: bool = True,
+    ) -> dict[str, int]:
+        """Mark a fresh ROI start: optional close opens, clear old snaps, write baseline."""
+        now = _utc_now()
+        closed = 0
+        deleted = 0
+        with self._connect() as conn:
+            if close_open_trades:
+                cur = conn.execute(
+                    """
+                    UPDATE trades
+                    SET status='canceled', exit_reason='roi_fresh_start',
+                        exit_price=COALESCE(entry, 0), pnl=0, r_multiple=0, closed_at=?
+                    WHERE status='open' AND source=?
+                    """,
+                    (now, source),
+                )
+                closed = cur.rowcount
+            if clear_prior_snapshots:
+                cur = conn.execute(
+                    "DELETE FROM equity_snapshots WHERE source=?",
+                    (source,),
+                )
+                deleted = cur.rowcount
+            conn.execute(
+                "INSERT INTO equity_snapshots (source, equity, ts, note) VALUES (?,?,?,?)",
+                (source, equity, now, "roi_baseline"),
+            )
+        return {"closed_opens": closed, "deleted_snapshots": deleted}
+
+    def list_open_trades(
+        self,
+        *,
+        source: str | None = "live",
+        limit: int = 20,
+        channel_key: str | None = None,
+    ) -> list[TradeRow]:
         q = "SELECT * FROM trades WHERE status='open'"
         params: list[Any] = []
         if source:
             q += " AND source=?"
             params.append(source)
+        if channel_key:
+            q += " AND channel_key=?"
+            params.append(channel_key)
         q += " ORDER BY opened_at DESC LIMIT ?"
         params.append(limit)
         with self._connect() as conn:
@@ -199,6 +314,7 @@ class TradeStore:
 
     @staticmethod
     def _row(r: sqlite3.Row) -> TradeRow:
+        keys = r.keys()
         return TradeRow(
             id=r["id"],
             source=r["source"],
@@ -221,4 +337,6 @@ class TradeStore:
             window_start=r["window_start"],
             window_end=r["window_end"],
             timeframe_raw=r["timeframe_raw"],
+            channel_key=r["channel_key"] if "channel_key" in keys else None,
+            exchange=r["exchange"] if "exchange" in keys else None,
         )

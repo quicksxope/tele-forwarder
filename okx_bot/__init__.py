@@ -1,6 +1,6 @@
-"""Signal parser bot package (OKX / Bybit via CCXT)."""
+"""Signal parser bot package (OKX / Bybit / Binance via CCXT)."""
 from .parser import Signal, parse_signal
-from .trader import BybitTrader, OkxTrader, make_trader
+from .trader import BinanceTrader, BybitTrader, OkxTrader, make_trader
 from .metrics import PeriodMetrics, compute_metrics
 from .trade_store import TradeStore
 from .backtest import Backtester, BacktestConfig
@@ -10,6 +10,7 @@ __all__ = [
     "parse_signal",
     "OkxTrader",
     "BybitTrader",
+    "BinanceTrader",
     "make_trader",
     "PeriodMetrics",
     "compute_metrics",
