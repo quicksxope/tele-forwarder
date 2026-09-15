@@ -354,7 +354,9 @@ def _positions_text(
 
     stale = [t for t in db_opens if t.id not in matched_ids]
     if stale:
-        lines.append(f"\nDB stale (open di DB, tidak di exchange): {len(stale)}")
+        lines.append(
+            f"\nOrphan / pending reconcile (open di DB, tidak di exchange): {len(stale)}"
+        )
         for t in stale[:8]:
             ch = _channel_label(getattr(t, "channel_key", None))
             ex = (getattr(t, "exchange", None) or "?").upper()
@@ -411,26 +413,28 @@ def _pnl_text(
     traders: list[tuple[str, Any]] | None = None,
 ) -> str:
     scope = "All" if not channel_key else channel_key
-    live = ""
+    parts: list[str] = []
     if traders and channel_key is None:
         live = _live_pnl_header(traders)
         if live:
-            live = f"{live}\n\n————\n\n"
+            parts.append(f"Exchange live\n{live}")
     text_7 = _period_metrics_text(
         store,
         weeks=1,
         source="live",
-        title=f"PnL · 7 hari · {scope} (DB closed trades)",
+        title=f"Bot DB closed trades · 7 hari · {scope}",
         channel_key=channel_key,
     )
     text_30 = _period_metrics_text(
         store,
         weeks=4,
         source="live",
-        title=f"PnL · 30 hari · {scope} (DB closed trades)",
+        title=f"Bot DB closed trades · 30 hari · {scope}",
         channel_key=channel_key,
     )
-    return f"{live}{text_7}\n\n————\n\n{text_30}"
+    parts.append(text_7)
+    parts.append(text_30)
+    return "\n\n————\n\n".join(parts)
 
 
 def _trader_usdt_equity(trader) -> float | None:
@@ -597,6 +601,7 @@ def _roi_text(
             f"Closed trades: {m.n_closed} (W{m.n_wins}/L{m.n_losses})"
             f"{note}"
         )
+    chunks.append("ℹ️ ROI = wallet mark-to-market vs baseline — ROI ≠ Σ trades.pnl")
     return "\n\n————\n\n".join(chunks)
 
 

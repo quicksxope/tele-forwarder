@@ -242,7 +242,7 @@ def _resolve_amount(
     symbol: str,
     exchange_label: str,
 ) -> float:
-    """Fixed amount, or % of USDT equity when equity_pct > 0."""
+    """Fixed amount, or % of USDT equity as 1R risk when equity_pct > 0."""
     if equity_pct <= 0:
         raw = amount
     else:
@@ -264,17 +264,44 @@ def _resolve_amount(
             if equity is None:
                 raise ValueError(f"No USDT balance found on {exchange_label}")
 
-        margin = equity * (equity_pct / 100.0)
-        notional = margin * leverage
-        raw = notional / signal.entry
-        logger.info(
-            "Size from equity: %.2f USDT × %.1f%% × %sx / %s = %s",
-            equity,
-            equity_pct,
-            leverage,
-            signal.entry,
-            raw,
-        )
+        # TRADE_EQUITY_PCT = max loss at SL (1R), not margin %.
+        if signal.stop_loss is None:
+            logger.warning(
+                "%s: equity_pct set but signal has no stop_loss — "
+                "falling back to fixed amount=%s",
+                exchange_label,
+                amount,
+            )
+            raw = amount
+        else:
+            stop_dist = abs(float(signal.entry) - float(signal.stop_loss))
+            if stop_dist <= 0:
+                raise ValueError(
+                    f"{exchange_label}: stop_loss equals entry — cannot size 1R"
+                )
+            risk_usdt = equity * (equity_pct / 100.0)
+            raw = risk_usdt / stop_dist
+            # Cap notional so we never exceed full equity at configured leverage.
+            max_notional = equity * max(leverage, 1)
+            notional = raw * float(signal.entry)
+            if notional > max_notional and float(signal.entry) > 0:
+                capped = max_notional / float(signal.entry)
+                logger.warning(
+                    "1R size capped: notional %.2f > max %.2f — qty %s → %s",
+                    notional,
+                    max_notional,
+                    raw,
+                    capped,
+                )
+                raw = capped
+            logger.info(
+                "Size from 1R risk: %.2f USDT × %.1f%% = %.2f risk / stop_dist %s = %s",
+                equity,
+                equity_pct,
+                risk_usdt,
+                stop_dist,
+                raw,
+            )
     return _finalize_amount(
         exchange, symbol, raw, dry_run=dry_run, price=signal.entry
     )
@@ -698,8 +725,6 @@ class BinanceTrader:
         if amount <= 0:
             return "TP/SL skipped (amount=0)"
         _binance_load_markets(self.exchange)
-        if self._has_open_protective_orders(symbol):
-            return "TP/SL already open — skip"
         close_side = "buy" if signal.side == "sell" else "sell"
         amount = self._clamp_amount(symbol, amount)
         pos_params = self._position_side_params(signal.side)
@@ -720,6 +745,7 @@ class BinanceTrader:
         skipped: list[str] = []
 
         # If mark already through SL, market-close immediately (STOP would -2021).
+        # Do this BEFORE the "already open" skip so breached positions still close.
         if (
             close_if_sl_breached
             and signal.stop_loss is not None
@@ -747,6 +773,9 @@ class BinanceTrader:
             except Exception as e:
                 logger.warning("Emergency SL close failed: %s", e)
                 return f"SL breached but close failed: {e}"
+
+        if self._has_open_protective_orders(symbol):
+            return "TP/SL already open — skip"
 
         def _place(
             kind: str,

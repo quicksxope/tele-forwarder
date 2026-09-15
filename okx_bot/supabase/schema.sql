@@ -36,6 +36,7 @@ create table if not exists public.trades (
   window_start    timestamptz,                  -- signal validity window (WIB→UTC)
   window_end      timestamptz,
   timeframe_raw   text,                         -- original "15:07-19:07 WIB"
+  exchange        text,                         -- okx | bybit | binance
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now()
 );
@@ -171,3 +172,6 @@ create trigger trg_user_credentials_updated_at
 alter table public.user_credentials enable row level security;
 
 comment on table public.user_credentials is 'Per-user exchange API credentials (Fernet-encrypted, keyed by Telegram user ID)';
+
+-- Lightweight migrations for existing DBs
+alter table public.trades add column if not exists exchange text;

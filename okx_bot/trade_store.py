@@ -36,6 +36,7 @@ class TradeRow:
     window_end: str | None
     timeframe_raw: str | None
     channel_key: str | None = None
+    exchange: str | None = None
 
 
 class TradeStore:
@@ -146,9 +147,41 @@ class TradeStore:
                 """
                 UPDATE trades
                 SET status=?, exit_price=?, exit_reason=?, pnl=?, r_multiple=?, closed_at=?
-                WHERE id=?
+                WHERE id=? AND status='open'
                 """,
                 (status, exit_price, exit_reason, pnl, r_multiple, _utc_now(), trade_id),
+            )
+
+    def close_trade_by_order_id(
+        self,
+        order_id: str,
+        *,
+        status: str,
+        exit_reason: str,
+        exit_price: float | None = None,
+        pnl: float | None = None,
+        r_multiple: float | None = None,
+    ) -> None:
+        sets = ["status=?", "exit_reason=?", "closed_at=?"]
+        params: list[Any] = [status, exit_reason, _utc_now()]
+        if exit_price is not None:
+            sets.append("exit_price=?")
+            params.append(exit_price)
+        if pnl is not None:
+            sets.append("pnl=?")
+            params.append(pnl)
+        if r_multiple is not None:
+            sets.append("r_multiple=?")
+            params.append(r_multiple)
+        params.append(order_id)
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE trades
+                SET {', '.join(sets)}
+                WHERE order_id=? AND status='open'
+                """,
+                params,
             )
 
     def snapshot_equity(self, equity: float, *, source: str = "live", note: str = "") -> None:
@@ -305,4 +338,5 @@ class TradeStore:
             window_end=r["window_end"],
             timeframe_raw=r["timeframe_raw"],
             channel_key=r["channel_key"] if "channel_key" in keys else None,
+            exchange=r["exchange"] if "exchange" in keys else None,
         )

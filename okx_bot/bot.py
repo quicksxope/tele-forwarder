@@ -21,6 +21,7 @@ from .exchange_runtime import (
     toggle_exchange,
 )
 from .parser import Signal
+from .pnl import close_metrics, infer_exit_status, is_position_flat, position_contracts
 from .settings_menu import register_settings_menu
 from .supabase_store import make_store
 from .trader import BinanceTrader, BybitTrader, OkxTrader, Trader, make_trader, make_trader_for_exchange, required_credentials
@@ -297,6 +298,61 @@ async def _watch_fill_and_attach_protective(
         await asyncio.sleep(poll_s)
 
 
+async def _maybe_close_flat_trade(
+    *,
+    store,
+    trade,
+    exit_price: float,
+    exit_reason: str,
+    status: str | None = None,
+) -> tuple[float, float, str]:
+    """Compute pnl/R and close DB trade. Returns (pnl, r, status)."""
+    side = (trade.side or "buy").lower()
+    entry = float(trade.entry or 0)
+    amount = float(trade.amount or 0)
+    sl = float(trade.stop_loss) if trade.stop_loss is not None else None
+    tp = float(trade.take_profit) if trade.take_profit is not None else None
+    pnl, r = close_metrics(
+        side=side, entry=entry, exit_price=exit_price, amount=amount, stop_loss=sl
+    )
+    st = status or infer_exit_status(
+        side=side, entry=entry, exit_price=exit_price, stop_loss=sl, take_profit=tp
+    )
+    if hasattr(store, "close_trade"):
+        await _run_sync(
+            store.close_trade,
+            trade.id,
+            status=st,
+            exit_price=float(exit_price),
+            exit_reason=exit_reason,
+            pnl=float(pnl),
+            r_multiple=float(r),
+        )
+    return pnl, r, st
+
+
+async def _entry_still_pending(trader, trade) -> bool:
+    """True if entry order exists and has not filled yet (skip flat-close)."""
+    order_id = getattr(trade, "order_id", None)
+    symbol = getattr(trade, "symbol", None) or getattr(trade, "pair", None)
+    if not order_id or not symbol or not hasattr(trader, "fetch_order"):
+        return False
+    try:
+        order = await _run_sync(trader.fetch_order, str(order_id), symbol)
+    except Exception:
+        return False
+    status = (order.get("status") or "").lower()
+    try:
+        filled = float(order.get("filled") or 0)
+    except (TypeError, ValueError):
+        filled = 0.0
+    if filled > 0:
+        return False
+    if status in ("canceled", "cancelled", "expired", "rejected", "closed", "filled"):
+        return False
+    return True
+
+
 async def _reconcile_binance_stops(
     *,
     client: TelegramClient,
@@ -306,8 +362,11 @@ async def _reconcile_binance_stops(
     rt_path,
     notif_chat: int,
     attached: set[str],
+    fail_counts: dict[int, int],
+    orphan_alerted: set[str],
+    close_fail_escalate: int = 3,
 ) -> None:
-    """Close positions past SL; attach missing TP/SL for open Binance trades."""
+    """Close positions past SL; sync flat exits; attach missing TP/SL; orphan alerts."""
     traders = await _run_sync(
         _resolve_order_traders, store, owner_id, cfg, rt_path=rt_path
     )
@@ -318,7 +377,7 @@ async def _reconcile_binance_stops(
         return
 
     opens = await _run_sync(store.list_open_trades, source="live", limit=100)
-    if not opens:
+    if not opens and not binance_traders:
         return
 
     for ex_name, trader in binance_traders:
@@ -328,21 +387,63 @@ async def _reconcile_binance_stops(
             logger.exception("reconcile: fetch_open_positions failed")
             continue
         by_sym = {_norm_trade_sym(p.get("symbol")): p for p in positions}
+        matched_syms: set[str] = set()
+
         for t in opens:
             ex = (getattr(t, "exchange", None) or "").lower()
             if ex and ex != "binance":
                 continue
             key = _norm_trade_sym(t.symbol or t.pair)
             pos = by_sym.get(key)
-            if not pos:
-                continue
-            mark = pos.get("mark")
-            amount = float(pos.get("contracts") or t.amount or 0)
-            if amount <= 0 or mark is None:
-                continue
             sig = _signal_from_trade(t)
             attach_key = f"{ex_name}:{t.id}"
             sym_key = f"{ex_name}:sym:{key}"
+
+            # --- Exchange flat while DB still open → close with real pnl/R ---
+            if is_position_flat(pos):
+                if await _entry_still_pending(trader, t):
+                    continue
+                exit_px = float(t.entry or 0)
+                # Best-effort last price for better tp/sl inference.
+                try:
+                    if hasattr(trader, "exchange") and t.symbol:
+                        ticker = await _run_sync(trader.exchange.fetch_ticker, t.symbol)
+                        last = ticker.get("last") or ticker.get("close")
+                        if last is not None:
+                            exit_px = float(last)
+                except Exception:
+                    if sig.stop_loss is not None and sig.take_profit is None:
+                        exit_px = float(sig.stop_loss)
+                    elif sig.take_profit is not None and sig.stop_loss is None:
+                        exit_px = float(sig.take_profit)
+                try:
+                    pnl, r, st = await _maybe_close_flat_trade(
+                        store=store,
+                        trade=t,
+                        exit_price=exit_px,
+                        exit_reason="exchange_flat",
+                    )
+                except Exception:
+                    logger.exception("exchange_flat close failed for #%s", t.id)
+                    continue
+                fail_counts.pop(t.id, None)
+                try:
+                    await client.send_message(
+                        notif_chat,
+                        f"✅ Position flat — DB closed\n"
+                        f"#{t.id} {t.pair} {(t.side or '').upper()} → {st}\n"
+                        f"Exit ~{exit_px} · PnL {pnl:+.4f} · R {r:+.2f}\n"
+                        f"reason=exchange_flat",
+                    )
+                except Exception:
+                    pass
+                continue
+
+            matched_syms.add(key)
+            mark = pos.get("mark")
+            amount = position_contracts(pos) or float(t.amount or 0)
+            if amount <= 0 or mark is None:
+                continue
 
             if sig.stop_loss is not None and _sl_breached(
                 side=sig.side, mark=float(mark), stop_loss=float(sig.stop_loss)
@@ -355,25 +456,54 @@ async def _reconcile_binance_stops(
                 )
                 attached.add(attach_key)
                 attached.add(sym_key)
-                if hasattr(store, "close_trade"):
+
+                # Re-verify exchange is flat before touching DB.
+                try:
+                    positions2 = await _run_sync(trader.fetch_open_positions)
+                except Exception:
+                    logger.exception("reconcile re-fetch positions failed")
+                    positions2 = positions
+                by_sym2 = {_norm_trade_sym(p.get("symbol")): p for p in positions2}
+                pos2 = by_sym2.get(key)
+                if not is_position_flat(pos2):
+                    n = fail_counts.get(t.id, 0) + 1
+                    fail_counts[t.id] = n
+                    msg = (
+                        f"⚠️ SL breached but exchange still open\n"
+                        f"#{t.id} {t.pair} {(t.side or '').upper()}\n"
+                        f"Mark {mark} · SL {sig.stop_loss}\n"
+                        f"Attempt {n}/{close_fail_escalate}\n"
+                        f"{note}\n"
+                        f"DB left OPEN (no fake close)."
+                    )
+                    if n >= close_fail_escalate:
+                        msg += "\n🚨 Manual intervene — close failed repeatedly."
                     try:
-                        await _run_sync(
-                            store.close_trade,
-                            t.id,
-                            status="sl",
-                            exit_price=float(mark),
-                            exit_reason="reconcile_sl_breach",
-                            pnl=0.0,
-                            r_multiple=0.0,
-                        )
+                        await client.send_message(notif_chat, msg)
                     except Exception:
-                        logger.exception("close_trade failed for #%s", t.id)
+                        pass
+                    continue
+
+                exit_px = float(mark)
+                try:
+                    pnl, r, st = await _maybe_close_flat_trade(
+                        store=store,
+                        trade=t,
+                        exit_price=exit_px,
+                        exit_reason="reconcile_sl_breach",
+                        status="sl",
+                    )
+                except Exception:
+                    logger.exception("close_trade failed for #%s", t.id)
+                    continue
+                fail_counts.pop(t.id, None)
                 try:
                     await client.send_message(
                         notif_chat,
-                        f"🛑 SL breached — force close\n"
+                        f"🛑 SL breached — closed\n"
                         f"#{t.id} {t.pair} {(t.side or '').upper()}\n"
-                        f"Mark {mark} · SL {sig.stop_loss}\n"
+                        f"Mark {exit_px} · SL {sig.stop_loss}\n"
+                        f"PnL {pnl:+.4f} · R {r:+.2f}\n"
                         f"{note}",
                     )
                 except Exception:
@@ -391,7 +521,34 @@ async def _reconcile_binance_stops(
                 amount=amount,
             )
             note_l = (note or "").lower()
-            # Treat success / already-open as done; don't spam "not placed" DMs.
+            # If protective path market-closed, sync DB.
+            if "closed market" in note_l or "sl→market" in note_l:
+                try:
+                    positions2 = await _run_sync(trader.fetch_open_positions)
+                    by_sym2 = {_norm_trade_sym(p.get("symbol")): p for p in positions2}
+                    if is_position_flat(by_sym2.get(key)):
+                        pnl, r, st = await _maybe_close_flat_trade(
+                            store=store,
+                            trade=t,
+                            exit_price=float(mark),
+                            exit_reason="protective_market_close",
+                            status="sl",
+                        )
+                        fail_counts.pop(t.id, None)
+                        try:
+                            await client.send_message(
+                                notif_chat,
+                                f"🛑 Protective market close\n"
+                                f"#{t.id} {t.pair}\n"
+                                f"PnL {pnl:+.4f} · R {r:+.2f}\n"
+                                f"{note}",
+                            )
+                        except Exception:
+                            pass
+                        continue
+                except Exception:
+                    logger.exception("post-protective flat sync failed #%s", t.id)
+
             if "already open" in note_l or (
                 "placed" in note_l and "not placed" not in note_l
             ):
@@ -401,7 +558,6 @@ async def _reconcile_binance_stops(
                 attached.add(attach_key)
                 attached.add(sym_key)
             else:
-                # Transient failure — retry next loop; still remember briefly? no.
                 logger.warning("Reconcile protective #%s: %s", t.id, note)
                 continue
             logger.info("Reconcile protective #%s: %s", t.id, note)
@@ -413,6 +569,34 @@ async def _reconcile_binance_stops(
                     f"🛡️ Protective reconcile\n"
                     f"#{t.id} {t.pair}\n"
                     f"{note}",
+                )
+            except Exception:
+                pass
+
+        # --- Orphan: exchange position with no matching DB open ---
+        db_keys = {
+            _norm_trade_sym(t.symbol or t.pair)
+            for t in opens
+            if not (getattr(t, "exchange", None) or "")
+            or (getattr(t, "exchange", None) or "").lower() == "binance"
+        }
+        for p in positions:
+            key = _norm_trade_sym(p.get("symbol"))
+            if not key or key in matched_syms or key in db_keys:
+                continue
+            alert_key = f"{ex_name}:orphan:{key}"
+            if alert_key in orphan_alerted:
+                continue
+            orphan_alerted.add(alert_key)
+            try:
+                await client.send_message(
+                    notif_chat,
+                    f"👻 Orphan position (no DB open trade)\n"
+                    f"{p.get('symbol')} {(p.get('side') or '?').upper()} "
+                    f"size {p.get('contracts')}\n"
+                    f"entry {p.get('entry')} · mark {p.get('mark')}\n"
+                    f"uPnL {p.get('unrealized_pnl')}\n"
+                    f"Bot will not invent a trade — manage manually.",
                 )
             except Exception:
                 pass
@@ -429,6 +613,8 @@ async def _sl_guard_loop(
     interval_s: float = 60.0,
 ) -> None:
     attached: set[str] = set()
+    fail_counts: dict[int, int] = {}
+    orphan_alerted: set[str] = set()
     await asyncio.sleep(20)  # let startup settle
     while True:
         try:
@@ -440,6 +626,8 @@ async def _sl_guard_loop(
                 rt_path=rt_path,
                 notif_chat=notif_chat,
                 attached=attached,
+                fail_counts=fail_counts,
+                orphan_alerted=orphan_alerted,
             )
         except Exception:
             logger.exception("SL guard loop error")
@@ -463,7 +651,7 @@ async def _cmd_status(
     m, s = divmod(rem, 60)
     store_name = type(store).__name__
     if trader.equity_pct > 0:
-        size_line = f"Size: {trader.equity_pct}% of USDT equity\n"
+        size_line = f"Size: {trader.equity_pct}% equity as 1R risk at SL\n"
     else:
         size_line = f"Size: fixed {trader.amount} (base coin)\n"
     await event.reply(
@@ -1088,7 +1276,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                 _t = order_traders[0][1]
                 if _t.equity_pct > 0:
                     size_rule = (
-                        f"Size: {_t.equity_pct}% USDT equity (margin) × {lev}x notional\n"
+                        f"Size: {_t.equity_pct}% USDT equity as 1R risk at SL\n"
                     )
                 else:
                     size_rule = f"Size: fixed {_t.amount} (base coin)\n"

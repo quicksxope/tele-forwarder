@@ -73,6 +73,7 @@ class SupabaseStore:
         row = {
             "source": fields.get("source", "live"),
             "channel_key": fields.get("channel_key"),
+            "exchange": fields.get("exchange"),
             "pair": fields["pair"],
             "symbol": fields["symbol"],
             "side": fields["side"],
@@ -93,6 +94,10 @@ class SupabaseStore:
             "window_end": _iso(fields.get("window_end")),
             "timeframe_raw": fields.get("timeframe_raw"),
         }
+        # Drop None exchange so older schemas without the column still work
+        # if PostgREST rejects unknown cols — keep it when set.
+        if row.get("exchange") is None:
+            row.pop("exchange", None)
         data = self._request(
             "POST",
             "trades",
@@ -114,7 +119,7 @@ class SupabaseStore:
         self._request(
             "PATCH",
             "trades",
-            query={"id": f"eq.{trade_id}"},
+            query={"id": f"eq.{trade_id}", "status": "eq.open"},
             body={
                 "status": status,
                 "exit_price": exit_price,
@@ -446,10 +451,8 @@ class SupabaseStore:
             window_end=r.get("window_end"),
             timeframe_raw=r.get("timeframe_raw"),
             channel_key=r.get("channel_key"),
+            exchange=r.get("exchange"),
         )
-
-
-class PostgresStore:
     """Direct Postgres via DATABASE_URL (Supabase connection string)."""
 
     def __init__(self, database_url: str) -> None:
@@ -471,6 +474,7 @@ class PostgresStore:
         cols = {
             "source": fields.get("source", "live"),
             "channel_key": fields.get("channel_key"),
+            "exchange": fields.get("exchange"),
             "pair": fields["pair"],
             "symbol": fields["symbol"],
             "side": fields["side"],
@@ -491,6 +495,8 @@ class PostgresStore:
             "window_end": _iso(fields.get("window_end")),
             "timeframe_raw": fields.get("timeframe_raw"),
         }
+        if cols.get("exchange") is None:
+            cols.pop("exchange", None)
         names = ", ".join(cols)
         placeholders = ", ".join(f"%({k})s" for k in cols)
         with self._connect() as conn:
@@ -499,7 +505,7 @@ class PostgresStore:
                 cols,
             ).fetchone()
             conn.commit()
-        return int(row["id"])
+            return int(row["id"])
 
     def close_trade(
         self,
@@ -517,7 +523,7 @@ class PostgresStore:
                 UPDATE trades
                 SET status=%s, exit_price=%s, exit_reason=%s,
                     pnl=%s, r_multiple=%s, closed_at=%s
-                WHERE id=%s
+                WHERE id=%s AND status='open'
                 """,
                 (status, exit_price, exit_reason, pnl, r_multiple, _utc_now(), trade_id),
             )
@@ -808,6 +814,7 @@ class PostgresStore:
             window_end=_s(r.get("window_end")),
             timeframe_raw=r.get("timeframe_raw"),
             channel_key=r.get("channel_key"),
+            exchange=r.get("exchange"),
         )
 
 
