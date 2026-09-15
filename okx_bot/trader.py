@@ -631,10 +631,14 @@ class BinanceTrader:
         symbol: str,
         signal: Signal,
         amount: float,
+        *,
+        close_if_sl_breached: bool = True,
     ) -> str:
         """Place reduce-only TP/SL after entry fill. Returns a short status note."""
         if signal.take_profit is None and signal.stop_loss is None:
             return ""
+        if amount <= 0:
+            return "TP/SL skipped (amount=0)"
         close_side = "buy" if signal.side == "sell" else "sell"
         base_params: dict[str, Any] = {
             "reduceOnly": True,
@@ -644,6 +648,35 @@ class BinanceTrader:
         mark = _fetch_mark_price(self.exchange, symbol)
         placed: list[str] = []
         skipped: list[str] = []
+
+        # If mark already through SL, market-close immediately (STOP would -2021).
+        if (
+            close_if_sl_breached
+            and signal.stop_loss is not None
+            and mark is not None
+            and not _binance_exit_trigger_valid(
+                entry_side=signal.side,
+                mark=mark,
+                trigger=signal.stop_loss,
+                kind="sl",
+            )
+        ):
+            try:
+                self.exchange.create_order(
+                    symbol,
+                    "market",
+                    close_side,
+                    amount,
+                    None,
+                    {**base_params},
+                )
+                return (
+                    f"SL breached (mark {mark} vs SL {signal.stop_loss}) "
+                    "— closed market"
+                )
+            except Exception as e:
+                logger.warning("Emergency SL close failed: %s", e)
+                return f"SL breached but close failed: {e}"
 
         def _place(kind: str, otype: str, trigger: float) -> None:
             if mark is not None and not _binance_exit_trigger_valid(
@@ -666,6 +699,27 @@ class BinanceTrader:
                 )
                 placed.append(kind.upper())
             except Exception as e:
+                err = str(e)
+                # Already past trigger race: fall back to market close for SL.
+                if (
+                    kind == "sl"
+                    and close_if_sl_breached
+                    and ("-2021" in err or "immediately trigger" in err.lower())
+                ):
+                    try:
+                        self.exchange.create_order(
+                            symbol,
+                            "market",
+                            close_side,
+                            amount,
+                            None,
+                            {**base_params},
+                        )
+                        placed.append("SL→MARKET")
+                        return
+                    except Exception as e2:
+                        skipped.append(f"SL({e2})")
+                        return
                 logger.warning("Binance %s order failed: %s", kind, e)
                 skipped.append(f"{kind.upper()}({e})")
 
@@ -681,6 +735,16 @@ class BinanceTrader:
         if skipped:
             return f"TP/SL not placed ({', '.join(skipped)})"
         return ""
+
+    def attach_protective_orders(
+        self, signal: Signal, *, symbol: str | None = None, amount: float
+    ) -> str:
+        """Public wrapper to attach TP/SL (or emergency close) for an open position."""
+        if self.dry_run:
+            return "dry-run: skip protective"
+        sym = symbol or signal.swap_symbol
+        _binance_load_markets(self.exchange)
+        return self._place_binance_protective_orders(sym, signal, amount)
 
     def ensure_leverage(self, symbol: str, leverage: int) -> None:
         try:

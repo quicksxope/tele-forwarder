@@ -203,6 +203,233 @@ async def _cancel_when_window_ends(
             pass
 
 
+def _norm_trade_sym(s: str | None) -> str:
+    if not s:
+        return ""
+    return s.replace(":USDT", "").replace("-SWAP", "").replace("-", "/").upper()
+
+
+def _signal_from_trade(t) -> Signal:
+    return Signal(
+        pair=t.pair or "?",
+        side=(t.side or "buy").lower(),
+        entry=float(t.entry or 0),
+        raw_pair=t.pair or "?",
+        leverage=int(t.leverage) if t.leverage else None,
+        take_profit=float(t.take_profit) if t.take_profit is not None else None,
+        stop_loss=float(t.stop_loss) if t.stop_loss is not None else None,
+    )
+
+
+def _sl_breached(*, side: str, mark: float, stop_loss: float) -> bool:
+    if side == "buy":
+        return mark <= stop_loss
+    return mark >= stop_loss
+
+
+async def _watch_fill_and_attach_protective(
+    *,
+    client: TelegramClient,
+    trader: Trader,
+    notif_chat: int,
+    order_id: str,
+    symbol: str,
+    signal: Signal,
+    poll_s: float = 15.0,
+) -> None:
+    """Poll entry until fill, then attach Binance TP/SL (or emergency close)."""
+    if not hasattr(trader, "attach_protective_orders"):
+        return
+    if signal.take_profit is None and signal.stop_loss is None:
+        return
+    end = signal.window_end or signal.valid_until
+    end_utc = None
+    if end is not None:
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+
+    logger.info("Watching fill for protective TP/SL on %s order %s", symbol, order_id)
+    while True:
+        if end_utc and datetime.now(timezone.utc) >= end_utc:
+            logger.info("Protective watch stopped — window ended for %s", order_id)
+            return
+        try:
+            order = await _run_sync(trader.fetch_order, order_id, symbol)
+        except Exception:
+            logger.exception("Protective watch fetch_order failed for %s", order_id)
+            await asyncio.sleep(poll_s)
+            continue
+
+        status = (order.get("status") or "").lower()
+        filled = 0.0
+        try:
+            filled = float(order.get("filled") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if filled <= 0 and status in ("closed", "filled"):
+            try:
+                filled = float(order.get("amount") or 0)
+            except (TypeError, ValueError):
+                filled = 0.0
+
+        if filled > 0:
+            note = await _run_sync(
+                trader.attach_protective_orders, signal, symbol=symbol, amount=filled
+            )
+            logger.info("Protective after fill %s: %s", order_id, note)
+            try:
+                await client.send_message(
+                    notif_chat,
+                    f"🛡️ Protective orders · {signal.pair}\n"
+                    f"Order: {order_id}\n"
+                    f"Filled: {filled}\n"
+                    f"{note}",
+                )
+            except Exception:
+                pass
+            return
+
+        if status in ("canceled", "cancelled", "expired", "rejected"):
+            logger.info("Protective watch: entry %s is %s — stop", order_id, status)
+            return
+
+        await asyncio.sleep(poll_s)
+
+
+async def _reconcile_binance_stops(
+    *,
+    client: TelegramClient,
+    store,
+    owner_id: int,
+    cfg: dict,
+    rt_path,
+    notif_chat: int,
+    attached: set[str],
+) -> None:
+    """Close positions past SL; attach missing TP/SL for open Binance trades."""
+    traders = await _run_sync(
+        _resolve_order_traders, store, owner_id, cfg, rt_path=rt_path
+    )
+    binance_traders = [
+        (name, t) for name, t in traders if name == "binance" and hasattr(t, "attach_protective_orders")
+    ]
+    if not binance_traders or not hasattr(store, "list_open_trades"):
+        return
+
+    opens = await _run_sync(store.list_open_trades, source="live", limit=100)
+    if not opens:
+        return
+
+    for ex_name, trader in binance_traders:
+        try:
+            positions = await _run_sync(trader.fetch_open_positions)
+        except Exception:
+            logger.exception("reconcile: fetch_open_positions failed")
+            continue
+        by_sym = {_norm_trade_sym(p.get("symbol")): p for p in positions}
+        for t in opens:
+            ex = (getattr(t, "exchange", None) or "").lower()
+            if ex and ex != "binance":
+                continue
+            key = _norm_trade_sym(t.symbol or t.pair)
+            pos = by_sym.get(key)
+            if not pos:
+                continue
+            mark = pos.get("mark")
+            amount = float(pos.get("contracts") or t.amount or 0)
+            if amount <= 0 or mark is None:
+                continue
+            sig = _signal_from_trade(t)
+            attach_key = f"{ex_name}:{t.id}"
+
+            if sig.stop_loss is not None and _sl_breached(
+                side=sig.side, mark=float(mark), stop_loss=float(sig.stop_loss)
+            ):
+                note = await _run_sync(
+                    trader.attach_protective_orders,
+                    sig,
+                    symbol=pos.get("symbol") or t.symbol,
+                    amount=amount,
+                )
+                attached.add(attach_key)
+                if hasattr(store, "close_trade"):
+                    try:
+                        await _run_sync(
+                            store.close_trade,
+                            t.id,
+                            status="sl",
+                            exit_price=float(mark),
+                            exit_reason="reconcile_sl_breach",
+                            pnl=0.0,
+                            r_multiple=0.0,
+                        )
+                    except Exception:
+                        logger.exception("close_trade failed for #%s", t.id)
+                try:
+                    await client.send_message(
+                        notif_chat,
+                        f"🛑 SL breached — force close\n"
+                        f"#{t.id} {t.pair} {(t.side or '').upper()}\n"
+                        f"Mark {mark} · SL {sig.stop_loss}\n"
+                        f"{note}",
+                    )
+                except Exception:
+                    pass
+                continue
+
+            if attach_key in attached:
+                continue
+            if sig.stop_loss is None and sig.take_profit is None:
+                continue
+            note = await _run_sync(
+                trader.attach_protective_orders,
+                sig,
+                symbol=pos.get("symbol") or t.symbol,
+                amount=amount,
+            )
+            attached.add(attach_key)
+            logger.info("Reconcile protective #%s: %s", t.id, note)
+            if note and ("placed" in note.lower() or "closed" in note.lower()):
+                try:
+                    await client.send_message(
+                        notif_chat,
+                        f"🛡️ Protective reconcile\n"
+                        f"#{t.id} {t.pair}\n"
+                        f"{note}",
+                    )
+                except Exception:
+                    pass
+
+
+async def _sl_guard_loop(
+    *,
+    client: TelegramClient,
+    store,
+    owner_id: int,
+    cfg: dict,
+    rt_path,
+    notif_chat: int,
+    interval_s: float = 60.0,
+) -> None:
+    attached: set[str] = set()
+    await asyncio.sleep(20)  # let startup settle
+    while True:
+        try:
+            await _reconcile_binance_stops(
+                client=client,
+                store=store,
+                owner_id=owner_id,
+                cfg=cfg,
+                rt_path=rt_path,
+                notif_chat=notif_chat,
+                attached=attached,
+            )
+        except Exception:
+            logger.exception("SL guard loop error")
+        await asyncio.sleep(interval_s)
+
+
 async def _cmd_status(
     event,
     *,
@@ -632,6 +859,19 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             watch_chats,
         )
         notify_client = bot_client if bot_client is not None else client
+        _track(
+            asyncio.create_task(
+                _sl_guard_loop(
+                    client=notify_client,
+                    store=store,
+                    owner_id=owner_id,
+                    cfg=cfg,
+                    rt_path=rt_path,
+                    notif_chat=notif_chat,
+                )
+            )
+        )
+        notify_client = bot_client if bot_client is not None else client
 
         async def _dm(text_msg: str) -> None:
             try:
@@ -762,6 +1002,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             result_lines: list[str] = []
             trade_ids: list[int] = []
             cancel_jobs: list[tuple[Trader, str]] = []
+            protective_jobs: list[tuple[Trader, str]] = []
 
             for ex_name, active_trader in order_traders:
                 logger.info("Placing order on %s", ex_name)
@@ -808,6 +1049,13 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     )
                     if order_id and (signal.window_end or signal.valid_until):
                         cancel_jobs.append((active_trader, str(order_id)))
+                    note_l = (order.get("protective_note") or "").lower()
+                    if (
+                        order_id
+                        and hasattr(active_trader, "attach_protective_orders")
+                        and "pending" in note_l
+                    ):
+                        protective_jobs.append((active_trader, str(order_id)))
                 except Exception as e:
                     logger.exception("Order failed on %s", ex_name)
                     err = str(e)
@@ -860,6 +1108,19 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                             client=notify_client,
                             trader=active_trader,
                             store=store,
+                            notif_chat=notif_chat,
+                            order_id=order_id,
+                            symbol=signal.swap_symbol,
+                            signal=signal,
+                        )
+                    )
+                )
+            for active_trader, order_id in protective_jobs:
+                _track(
+                    asyncio.create_task(
+                        _watch_fill_and_attach_protective(
+                            client=notify_client,
+                            trader=active_trader,
                             notif_chat=notif_chat,
                             order_id=order_id,
                             symbol=signal.swap_symbol,

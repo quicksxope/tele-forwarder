@@ -1,6 +1,7 @@
 """Binance entry vs protective order behavior."""
 from __future__ import annotations
 
+from okx_bot.bot import _sl_breached
 from okx_bot.parser import Signal
 from okx_bot.trader import BinanceTrader, _binance_exit_trigger_valid
 
@@ -35,3 +36,10 @@ def test_binance_short_sl_tp_vs_mark() -> None:
     assert not _binance_exit_trigger_valid(
         entry_side="sell", mark=523.0, trigger=522.06, kind="sl"
     )
+
+
+def test_sl_breached_long_short() -> None:
+    assert _sl_breached(side="buy", mark=0.10, stop_loss=0.102)
+    assert not _sl_breached(side="buy", mark=0.103, stop_loss=0.102)
+    assert _sl_breached(side="sell", mark=522.0, stop_loss=520.0)
+    assert not _sl_breached(side="sell", mark=515.0, stop_loss=520.0)
