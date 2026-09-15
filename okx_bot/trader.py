@@ -230,6 +230,44 @@ def _finalize_amount(
     return amount
 
 
+def _usdt_balances(exchange: ccxt.Exchange) -> tuple[float, float]:
+    """Return (total, free) USDT; missing side falls back to the other."""
+    bal = exchange.fetch_balance()
+    usdt = bal.get("USDT") or {}
+    total = free = None
+    for key, dest in (("total", "total"), ("free", "free")):
+        val = usdt.get(key)
+        if val is not None:
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                continue
+            if f >= 0:
+                if dest == "total":
+                    total = f
+                else:
+                    free = f
+    if total is None:
+        tot = bal.get("total") or {}
+        if "USDT" in tot:
+            total = float(tot["USDT"])
+    if free is None:
+        fr = bal.get("free") or {}
+        if "USDT" in fr:
+            free = float(fr["USDT"])
+    if total is None and free is None:
+        raise ValueError("No USDT balance found")
+    if total is None:
+        total = free  # type: ignore[assignment]
+    if free is None:
+        free = total  # type: ignore[assignment]
+    return float(total), float(free)
+
+
+# Fraction of free USDT we may lock as initial margin (fees / buffer).
+_MARGIN_UTILIZATION = 0.85
+
+
 def _resolve_amount(
     exchange: ccxt.Exchange,
     *,
@@ -242,29 +280,23 @@ def _resolve_amount(
     symbol: str,
     exchange_label: str,
 ) -> float:
-    """Fixed amount, or % of USDT equity as 1R risk when equity_pct > 0."""
+    """Fixed amount, or % of USDT equity as 1R risk when equity_pct > 0.
+
+    Caps qty so required margin (notional/leverage) fits in free USDT × 0.85,
+    otherwise Binance returns -2019 on tight stops that inflate notional.
+    """
     if equity_pct <= 0:
         raw = amount
     else:
         if dry_run:
-            equity = equity_dry_usdt
+            equity = free = equity_dry_usdt
         else:
-            bal = exchange.fetch_balance()
-            usdt = bal.get("USDT") or {}
-            equity = None
-            for key in ("total", "free"):
-                val = usdt.get(key)
-                if val is not None and float(val) > 0:
-                    equity = float(val)
-                    break
-            if equity is None:
-                total = bal.get("total") or {}
-                if "USDT" in total:
-                    equity = float(total["USDT"])
-            if equity is None:
-                raise ValueError(f"No USDT balance found on {exchange_label}")
+            try:
+                equity, free = _usdt_balances(exchange)
+            except ValueError as e:
+                raise ValueError(f"{e} on {exchange_label}") from e
 
-        # TRADE_EQUITY_PCT = max loss at SL (1R), not margin %.
+        # TRADE_EQUITY_PCT = target max loss at SL (1R), not margin %.
         if signal.stop_loss is None:
             logger.warning(
                 "%s: equity_pct set but signal has no stop_loss — "
@@ -279,29 +311,48 @@ def _resolve_amount(
                 raise ValueError(
                     f"{exchange_label}: stop_loss equals entry — cannot size 1R"
                 )
+            entry = float(signal.entry)
             risk_usdt = equity * (equity_pct / 100.0)
             raw = risk_usdt / stop_dist
-            # Cap notional so we never exceed full equity at configured leverage.
-            max_notional = equity * max(leverage, 1)
-            notional = raw * float(signal.entry)
-            if notional > max_notional and float(signal.entry) > 0:
-                capped = max_notional / float(signal.entry)
+            # Affordable notional from free margin (not full equity × lev).
+            max_margin = max(free, 0.0) * _MARGIN_UTILIZATION
+            max_notional = max_margin * max(leverage, 1)
+            notional = raw * entry
+            if max_notional <= 0:
+                raise ValueError(
+                    f"{exchange_label}: no free USDT margin "
+                    f"(free={free:.4f}, total={equity:.4f})"
+                )
+            if notional > max_notional and entry > 0:
+                capped = max_notional / entry
+                eff_risk = capped * stop_dist
                 logger.warning(
-                    "1R size capped: notional %.2f > max %.2f — qty %s → %s",
+                    "1R size capped for margin: notional %.2f → %.2f "
+                    "(free %.2f × %.0f%% util × %sx); "
+                    "target risk %.2f → effective %.2f USDT; qty %s → %s",
                     notional,
                     max_notional,
+                    free,
+                    _MARGIN_UTILIZATION * 100,
+                    leverage,
+                    risk_usdt,
+                    eff_risk,
                     raw,
                     capped,
                 )
                 raw = capped
-            logger.info(
-                "Size from 1R risk: %.2f USDT × %.1f%% = %.2f risk / stop_dist %s = %s",
-                equity,
-                equity_pct,
-                risk_usdt,
-                stop_dist,
-                raw,
-            )
+            else:
+                logger.info(
+                    "Size from 1R risk: equity %.2f free %.2f × %.1f%% "
+                    "= %.2f risk / stop_dist %s = %s (notional %.2f)",
+                    equity,
+                    free,
+                    equity_pct,
+                    risk_usdt,
+                    stop_dist,
+                    raw,
+                    notional,
+                )
     return _finalize_amount(
         exchange, symbol, raw, dry_run=dry_run, price=signal.entry
     )
