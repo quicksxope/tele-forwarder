@@ -342,6 +342,7 @@ async def _reconcile_binance_stops(
                 continue
             sig = _signal_from_trade(t)
             attach_key = f"{ex_name}:{t.id}"
+            sym_key = f"{ex_name}:sym:{key}"
 
             if sig.stop_loss is not None and _sl_breached(
                 side=sig.side, mark=float(mark), stop_loss=float(sig.stop_loss)
@@ -353,6 +354,7 @@ async def _reconcile_binance_stops(
                     amount=amount,
                 )
                 attached.add(attach_key)
+                attached.add(sym_key)
                 if hasattr(store, "close_trade"):
                     try:
                         await _run_sync(
@@ -378,7 +380,7 @@ async def _reconcile_binance_stops(
                     pass
                 continue
 
-            if attach_key in attached:
+            if attach_key in attached or sym_key in attached:
                 continue
             if sig.stop_loss is None and sig.take_profit is None:
                 continue
@@ -388,18 +390,32 @@ async def _reconcile_binance_stops(
                 symbol=pos.get("symbol") or t.symbol,
                 amount=amount,
             )
-            attached.add(attach_key)
+            note_l = (note or "").lower()
+            # Treat success / already-open as done; don't spam "not placed" DMs.
+            if "already open" in note_l or (
+                "placed" in note_l and "not placed" not in note_l
+            ):
+                attached.add(attach_key)
+                attached.add(sym_key)
+            elif "closed" in note_l:
+                attached.add(attach_key)
+                attached.add(sym_key)
+            else:
+                # Transient failure — retry next loop; still remember briefly? no.
+                logger.warning("Reconcile protective #%s: %s", t.id, note)
+                continue
             logger.info("Reconcile protective #%s: %s", t.id, note)
-            if note and ("placed" in note.lower() or "closed" in note.lower()):
-                try:
-                    await client.send_message(
-                        notif_chat,
-                        f"🛡️ Protective reconcile\n"
-                        f"#{t.id} {t.pair}\n"
-                        f"{note}",
-                    )
-                except Exception:
-                    pass
+            if "already open" in note_l:
+                continue
+            try:
+                await client.send_message(
+                    notif_chat,
+                    f"🛡️ Protective reconcile\n"
+                    f"#{t.id} {t.pair}\n"
+                    f"{note}",
+                )
+            except Exception:
+                pass
 
 
 async def _sl_guard_loop(

@@ -626,6 +626,64 @@ class BinanceTrader:
             "positionSide": "LONG" if entry_side == "buy" else "SHORT",
         }
 
+    def _clamp_amount(self, symbol: str, amount: float) -> float:
+        """Clamp to market min/max lot so conditional/market exits don't -4005."""
+        try:
+            market = self.exchange.market(symbol)
+        except Exception:
+            market = (self.exchange.markets or {}).get(symbol) or {}
+        limits = (market.get("limits") or {}).get("amount") or {}
+        min_a = limits.get("min")
+        max_a = limits.get("max")
+        amt = float(amount)
+        if min_a is not None and amt < float(min_a):
+            amt = float(min_a)
+        if max_a is not None and float(max_a) > 0 and amt > float(max_a):
+            logger.info(
+                "Clamp amount %s → max %s for %s",
+                amt,
+                max_a,
+                symbol,
+            )
+            amt = float(max_a)
+        try:
+            return float(self.exchange.amount_to_precision(symbol, amt))
+        except Exception:
+            return amt
+
+    def _has_open_protective_orders(self, symbol: str) -> bool:
+        """True if STOP / TAKE_PROFIT (or algo) already working on symbol."""
+        try:
+            open_orders = self.exchange.fetch_open_orders(symbol) or []
+        except Exception:
+            open_orders = []
+        for o in open_orders:
+            typ = str(o.get("type") or "").upper()
+            if any(x in typ for x in ("STOP", "TAKE_PROFIT", "TRAILING")):
+                return True
+            info = o.get("info") or {}
+            info_typ = str(info.get("type") or info.get("orderType") or "").upper()
+            if any(x in info_typ for x in ("STOP", "TAKE_PROFIT", "TRAILING")):
+                return True
+        # Binance USDT-M conditional / algo open list (best-effort).
+        try:
+            if hasattr(self.exchange, "fapiPrivateGetOpenAlgoOrders"):
+                rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": self.exchange.market(symbol)["id"]})
+                if rows:
+                    return True
+        except Exception:
+            pass
+        try:
+            if hasattr(self.exchange, "fapiPrivateGetOpenOrderStrategy"):
+                rows = self.exchange.fapiPrivateGetOpenOrderStrategy(
+                    {"symbol": self.exchange.market(symbol)["id"]}
+                )
+                if rows:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _place_binance_protective_orders(
         self,
         symbol: str,
@@ -639,11 +697,23 @@ class BinanceTrader:
             return ""
         if amount <= 0:
             return "TP/SL skipped (amount=0)"
+        _binance_load_markets(self.exchange)
+        if self._has_open_protective_orders(symbol):
+            return "TP/SL already open — skip"
         close_side = "buy" if signal.side == "sell" else "sell"
-        base_params: dict[str, Any] = {
+        amount = self._clamp_amount(symbol, amount)
+        pos_params = self._position_side_params(signal.side)
+        # closePosition closes whole position (no qty) — Binance allows only ONE such order.
+        # Prefer it for SL; use qty reduceOnly for TP.
+        close_all_params: dict[str, Any] = {
+            "workingType": "MARK_PRICE",
+            "closePosition": True,
+            **pos_params,
+        }
+        reduce_params: dict[str, Any] = {
             "reduceOnly": True,
             "workingType": "MARK_PRICE",
-            **self._position_side_params(signal.side),
+            **pos_params,
         }
         mark = _fetch_mark_price(self.exchange, symbol)
         placed: list[str] = []
@@ -668,7 +738,7 @@ class BinanceTrader:
                     close_side,
                     amount,
                     None,
-                    {**base_params},
+                    {**reduce_params},
                 )
                 return (
                     f"SL breached (mark {mark} vs SL {signal.stop_loss}) "
@@ -678,7 +748,13 @@ class BinanceTrader:
                 logger.warning("Emergency SL close failed: %s", e)
                 return f"SL breached but close failed: {e}"
 
-        def _place(kind: str, otype: str, trigger: float) -> None:
+        def _place(
+            kind: str,
+            otype: str,
+            trigger: float,
+            *,
+            close_all: bool,
+        ) -> None:
             if mark is not None and not _binance_exit_trigger_valid(
                 entry_side=signal.side,
                 mark=mark,
@@ -688,19 +764,50 @@ class BinanceTrader:
                 skipped.append(kind.upper())
                 return
             stop = float(self.exchange.price_to_precision(symbol, trigger))
+            params = {**(close_all_params if close_all else reduce_params), "stopPrice": stop}
+            qty = amount
             try:
                 self.exchange.create_order(
-                    symbol,
-                    otype,
-                    close_side,
-                    amount,
-                    None,
-                    {**base_params, "stopPrice": stop},
+                    symbol, otype, close_side, qty, None, params
                 )
-                placed.append(kind.upper())
+                placed.append(kind.upper() + ("(all)" if close_all else ""))
+                return
             except Exception as e:
                 err = str(e)
-                # Already past trigger race: fall back to market close for SL.
+                # Qty too large → clamp again or switch SL to closePosition.
+                if "-4005" in err or "max quantity" in err.lower():
+                    if not close_all and kind == "sl":
+                        try:
+                            self.exchange.create_order(
+                                symbol,
+                                otype,
+                                close_side,
+                                amount,
+                                None,
+                                {**close_all_params, "stopPrice": stop},
+                            )
+                            placed.append("SL(all)")
+                            return
+                        except Exception as e2:
+                            err = str(e2)
+                            e = e2
+                    elif not close_all:
+                        try:
+                            half = self._clamp_amount(symbol, amount * 0.5)
+                            if half > 0 and half < amount:
+                                self.exchange.create_order(
+                                    symbol,
+                                    otype,
+                                    close_side,
+                                    half,
+                                    None,
+                                    {**reduce_params, "stopPrice": stop},
+                                )
+                                placed.append(f"{kind.upper()}(half)")
+                                return
+                        except Exception as e2:
+                            err = str(e2)
+                            e = e2
                 if (
                     kind == "sl"
                     and close_if_sl_breached
@@ -713,7 +820,7 @@ class BinanceTrader:
                             close_side,
                             amount,
                             None,
-                            {**base_params},
+                            {**reduce_params},
                         )
                         placed.append("SL→MARKET")
                         return
@@ -723,10 +830,11 @@ class BinanceTrader:
                 logger.warning("Binance %s order failed: %s", kind, e)
                 skipped.append(f"{kind.upper()}({e})")
 
+        # SL first with close-all; TP with sized qty (second close-all would be rejected).
         if signal.stop_loss is not None:
-            _place("sl", "STOP_MARKET", signal.stop_loss)
+            _place("sl", "STOP_MARKET", signal.stop_loss, close_all=True)
         if signal.take_profit is not None:
-            _place("tp", "TAKE_PROFIT_MARKET", signal.take_profit)
+            _place("tp", "TAKE_PROFIT_MARKET", signal.take_profit, close_all=False)
 
         if placed and not skipped:
             return f"TP/SL: {', '.join(placed)} placed"

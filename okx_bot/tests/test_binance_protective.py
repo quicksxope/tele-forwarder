@@ -43,3 +43,31 @@ def test_sl_breached_long_short() -> None:
     assert not _sl_breached(side="buy", mark=0.103, stop_loss=0.102)
     assert _sl_breached(side="sell", mark=522.0, stop_loss=520.0)
     assert not _sl_breached(side="sell", mark=515.0, stop_loss=520.0)
+
+
+def test_protective_success_note_filter() -> None:
+    """'not placed' must not count as success (substring 'placed')."""
+    note = 'TP/SL not placed (SL(binance {"code":-4005}))'
+    note_l = note.lower()
+    ok = "already open" in note_l or (
+        "placed" in note_l and "not placed" not in note_l
+    )
+    assert not ok
+    assert "placed" in "TP/SL: SL(all), TP placed".lower() and "not placed" not in "TP/SL: SL(all), TP placed".lower()
+
+
+def test_clamp_amount_respects_max() -> None:
+    trader = BinanceTrader(api_key="x", secret="y", dry_run=True)
+    trader.exchange.markets = {
+        "ACE/USDT:USDT": {
+            "symbol": "ACE/USDT:USDT",
+            "spot": False,
+            "swap": True,
+            "linear": True,
+            "precision": {"amount": 1.0},
+            "limits": {"amount": {"min": 1.0, "max": 100.0}},
+        }
+    }
+    trader.exchange.markets_by_id = {}
+    trader.exchange.precisionMode = 4
+    assert trader._clamp_amount("ACE/USDT:USDT", 137.0) == 100.0
