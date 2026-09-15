@@ -19,7 +19,7 @@ from .exchange_runtime import (
 )
 from .metrics import compute_metrics
 from .trader import BinanceTrader, BybitTrader, OkxTrader
-from .weekly_report import period_bounds
+from .weekly_report import period_bounds, period_bounds_today_wib
 
 logger = logging.getLogger("okx_bot.settings")
 
@@ -490,42 +490,72 @@ def _roi_text(
     channel_key: str | None = None,
     traders: list[tuple[str, Any]] | None = None,
 ) -> str:
-    """ROI from equity snapshots, live wallet, and/or closed-trade PnL."""
+    """ROI since baseline / today — ignores pre-reset equity & Binance income history."""
     scope = "All" if not channel_key else channel_key
     chunks: list[str] = []
     traders = list(traders or [])
 
     live_equity = _sum_live_equity(traders) if traders else None
-    if (
-        channel_key is None
-        and live_equity is not None
-        and hasattr(store, "snapshot_equity")
-    ):
+    baseline = None
+    if hasattr(store, "latest_equity_baseline"):
+        try:
+            baseline = store.latest_equity_baseline(source="live")
+        except Exception:
+            logger.exception("latest_equity_baseline failed")
+
+    if channel_key is None and live_equity is not None and hasattr(store, "snapshot_equity"):
         try:
             store.snapshot_equity(live_equity, source="live", note="roi_menu")
         except Exception:
             logger.exception("snapshot_equity failed")
 
+    if baseline:
+        b_ts, b_eq = baseline
+        chunks.append(
+            f"Baseline ROI: {b_eq:.4f} USDT @ {b_ts.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+    else:
+        chunks.append(
+            "⚠️ Belum ada `roi_baseline` — ROI bisa tercampur history lama. "
+            "Jalankan fresh start / reset baseline."
+        )
+
     if channel_key:
         chunks.append(
-            f"ℹ️ Channel `{channel_key}`: ROI = PnL channel / equity wallet "
-            "(wallet shared antar channel)."
+            f"ℹ️ Channel `{channel_key}`: ROI = PnL channel / equity baseline|wallet."
         )
     if live_equity is not None:
         venue = ", ".join(n.upper() for n, _ in traders) or "?"
         chunks.append(f"Live equity · {venue}: {live_equity:.4f} USDT")
 
-    for weeks, label in ((1, "7 hari"), (4, "30 hari")):
-        start, end = period_bounds(weeks)
-        equity_start = equity_end = None
-        estimated_start = False
+    periods: list[tuple[str, datetime, datetime]] = []
+    today_start, today_end = period_bounds_today_wib()
+    periods.append(("Hari ini (WIB)", today_start, today_end))
+    if baseline:
+        periods.append(("Sejak baseline", baseline[0], today_end))
+    else:
+        periods.append(("7 hari", *period_bounds(1)))
+        periods.append(("30 hari", *period_bounds(4)))
 
-        if channel_key is None and hasattr(store, "latest_equity_before"):
+    for label, start, end in periods:
+        equity_start = equity_end = None
+        note = ""
+
+        if baseline:
+            b_ts, b_eq = baseline
+            if start < b_ts:
+                start = b_ts
+                note = "\n(period di-clamp ke baseline)"
+            equity_start = b_eq
+        elif channel_key is None and hasattr(store, "latest_equity_before"):
             equity_start = store.latest_equity_before(start, source="live")
-            equity_end = store.latest_equity_before(end, source="live")
 
         if channel_key is None and live_equity is not None:
             equity_end = live_equity
+        elif channel_key is not None and live_equity is not None:
+            # Channel: PnL / wallet (or baseline if present).
+            equity_start = (baseline[1] if baseline else live_equity)
+            equity_end = None
 
         trades = (
             store.trades_between(
@@ -535,18 +565,16 @@ def _roi_text(
             else []
         )
 
-        if channel_key is None:
-            if equity_start is None and equity_end is not None and equity_end > 0:
-                days = weeks * 7
-                realized = _sum_realized_pnl(traders, days=days)
-                db_pnl = sum(float(t.pnl) for t in trades if t.pnl is not None)
-                delta = realized if realized is not None else db_pnl
-                equity_start = max(equity_end - delta, 1e-9)
-                estimated_start = True
-        elif live_equity is not None and live_equity > 0:
-            # Channel: ROI on wallet = channel closed PnL / current equity.
-            equity_start = live_equity
-            equity_end = None
+        # No Binance realized backfill — that included pre-reset demo PnL.
+        if (
+            channel_key is None
+            and equity_start is None
+            and equity_end is not None
+            and equity_end > 0
+        ):
+            db_pnl = sum(float(t.pnl) for t in trades if t.pnl is not None)
+            equity_start = max(equity_end - db_pnl, 1e-9)
+            note = "\n(equity start diestimasi dari live − DB PnL)"
 
         m = compute_metrics(
             trades,
@@ -559,12 +587,9 @@ def _roi_text(
         roi = f"{m.roi_pct:+.2f}%" if m.roi_pct is not None else "n/a"
         eq_s = f"{m.equity_start:.4f}" if m.equity_start is not None else "n/a"
         eq_e = f"{m.equity_end:.4f}" if m.equity_end is not None else "n/a"
-        note = ""
-        if estimated_start:
-            note = "\n(equity start diestimasi dari live − realized/PnL)"
         chunks.append(
             f"📉 ROI · {label} · {scope}\n"
-            f"Period: {start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}\n"
+            f"Period: {start.strftime('%Y-%m-%d %H:%M')} → {end.strftime('%Y-%m-%d %H:%M')} UTC\n"
             f"Equity start: {eq_s}\n"
             f"Equity end: {eq_e}\n"
             f"ROI: {roi}\n"

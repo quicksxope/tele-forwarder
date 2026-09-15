@@ -198,6 +198,66 @@ class TradeStore:
             ).fetchone()
         return float(row["equity"]) if row else None
 
+    def latest_equity_baseline(
+        self, *, source: str = "live", note_prefix: str = "roi_baseline"
+    ) -> tuple[datetime, float] | None:
+        """Most recent equity snapshot marked as ROI baseline (fresh start)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT equity, ts FROM equity_snapshots
+                WHERE source=? AND note LIKE ?
+                ORDER BY ts DESC LIMIT 1
+                """,
+                (source, f"{note_prefix}%"),
+            ).fetchone()
+        if not row:
+            return None
+        ts_raw = row["ts"]
+        if isinstance(ts_raw, str):
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        else:
+            ts = ts_raw
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc), float(row["equity"])
+
+    def reset_roi_baseline(
+        self,
+        equity: float,
+        *,
+        source: str = "live",
+        close_open_trades: bool = True,
+        clear_prior_snapshots: bool = True,
+    ) -> dict[str, int]:
+        """Mark a fresh ROI start: optional close opens, clear old snaps, write baseline."""
+        now = _utc_now()
+        closed = 0
+        deleted = 0
+        with self._connect() as conn:
+            if close_open_trades:
+                cur = conn.execute(
+                    """
+                    UPDATE trades
+                    SET status='canceled', exit_reason='roi_fresh_start',
+                        exit_price=COALESCE(entry, 0), pnl=0, r_multiple=0, closed_at=?
+                    WHERE status='open' AND source=?
+                    """,
+                    (now, source),
+                )
+                closed = cur.rowcount
+            if clear_prior_snapshots:
+                cur = conn.execute(
+                    "DELETE FROM equity_snapshots WHERE source=?",
+                    (source,),
+                )
+                deleted = cur.rowcount
+            conn.execute(
+                "INSERT INTO equity_snapshots (source, equity, ts, note) VALUES (?,?,?,?)",
+                (source, equity, now, "roi_baseline"),
+            )
+        return {"closed_opens": closed, "deleted_snapshots": deleted}
+
     def list_open_trades(
         self,
         *,
