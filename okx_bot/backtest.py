@@ -11,9 +11,18 @@ import ccxt
 
 from .metrics import PeriodMetrics, compute_metrics
 from .parser import Signal, parse_signal
+from .pnl import pnl_from_r, r_multiple  # re-export for callers/tests
 from .trade_store import TradeStore
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "BacktestConfig",
+    "Backtester",
+    "pnl_from_r",
+    "r_multiple",
+    "simulate_signal",
+]
 
 
 @dataclass
@@ -23,23 +32,6 @@ class BacktestConfig:
     starting_equity: float = 1000.0
     timeframe: str = "1m"
     sandbox: bool = True
-
-
-def r_multiple(side: str, entry: float, exit_price: float, stop_loss: float | None) -> float | None:
-    if stop_loss is None:
-        return None
-    risk = abs(entry - stop_loss)
-    if risk <= 0:
-        return None
-    if side == "buy":
-        return (exit_price - entry) / risk
-    return (entry - exit_price) / risk
-
-
-def pnl_from_r(r: float | None, risk_usdt: float) -> float:
-    if r is None:
-        return 0.0
-    return r * risk_usdt
 
 
 def simulate_signal(

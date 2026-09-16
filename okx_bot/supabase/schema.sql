@@ -36,6 +36,7 @@ create table if not exists public.trades (
   window_start    timestamptz,                  -- signal validity window (WIB→UTC)
   window_end      timestamptz,
   timeframe_raw   text,                         -- original "15:07-19:07 WIB"
+  exchange        text,                         -- okx | bybit | binance
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now()
 );
@@ -148,7 +149,7 @@ comment on table public.signal_events is 'Raw Telegram signals audit log';
 create table if not exists public.user_credentials (
   id           bigserial primary key,
   telegram_id  bigint not null,
-  exchange     text not null check (exchange in ('okx', 'bybit')),
+  exchange     text not null check (exchange in ('okx', 'bybit', 'binance')),
   api_key_enc  text not null,   -- Fernet-encrypted API key
   secret_enc   text not null,   -- Fernet-encrypted API secret
   extra_enc    text,            -- Fernet-encrypted passphrase (OKX) or empty (Bybit)
@@ -171,3 +172,6 @@ create trigger trg_user_credentials_updated_at
 alter table public.user_credentials enable row level security;
 
 comment on table public.user_credentials is 'Per-user exchange API credentials (Fernet-encrypted, keyed by Telegram user ID)';
+
+-- Lightweight migrations for existing DBs
+alter table public.trades add column if not exists exchange text;

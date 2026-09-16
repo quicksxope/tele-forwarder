@@ -20,10 +20,12 @@ channels:
   cryptocium:
     name: "Cryptocium SETUP"
     chat_id: -1003751705288
-    topic_id: 12160
+    topic_id: 2
     parser: cryptocium
     enabled: true
-    parse_only: true  # DM parse only; set false to trade
+    # false = trade together with dex_vip on the same OKX account
+    # (monitoring can still be filtered per channel in /settings)
+    parse_only: false
 
   # Example: another channel with the same text format — only change chat_id
   # dex_vip_backup:

@@ -1,6 +1,6 @@
 # OKX Signal Bot
 
-Parse Telegram signal channels and trade on **OKX** or **Bybit** via [CCXT](https://github.com/ccxt/ccxt).  
+Parse Telegram signal channels and trade on **OKX**, **Bybit**, or **Binance** via [CCXT](https://github.com/ccxt/ccxt).  
 Includes backtest, period metrics (win rate / ROI / avg R), and weekly Telegram reports.
 
 ## Layout
@@ -54,7 +54,7 @@ ACTIVE_CHANNEL=other_vip
 
 Built-in parsers: `dex_vip`, `okx_confirm`.
 
-## Exchange (OKX or Bybit)
+## Exchange (OKX, Bybit, or Binance)
 
 Set in `.env`:
 
@@ -63,13 +63,23 @@ EXCHANGE=bybit          # default: okx
 BYBIT_API_KEY=...
 BYBIT_SECRET=...
 BYBIT_SANDBOX=true      # testnet — separate API keys from mainnet
+
+# Binance USDT-M futures (demo trading)
+EXCHANGE=binance
+BINANCE_API_KEY=...
+BINANCE_SECRET=...
+BINANCE_DEMO=true       # keys from https://demo.binance.com → API Management
+# BINANCE_SANDBOX=true  # futures testnet — mutually exclusive with DEMO
 ```
 
 Parser stays `dex_vip` — only the execution venue changes. Test connection:
 
 ```bash
 PYTHONPATH=. uv run python okx_bot/scripts/test_bybit_order.py
+PYTHONPATH=. uv run python okx_bot/scripts/test_binance_order.py
 ```
+
+**Binance demo + Telkomsel / ISP:** if SSL fails with hostname mismatch (e.g. certificate `internetbaik.telkomsel.com`), the carrier is intercepting Binance HTTPS — use VPN, another network, or run the bot on a VPS.
 
 ## Setup
 

@@ -73,6 +73,7 @@ class SupabaseStore:
         row = {
             "source": fields.get("source", "live"),
             "channel_key": fields.get("channel_key"),
+            "exchange": fields.get("exchange"),
             "pair": fields["pair"],
             "symbol": fields["symbol"],
             "side": fields["side"],
@@ -93,6 +94,10 @@ class SupabaseStore:
             "window_end": _iso(fields.get("window_end")),
             "timeframe_raw": fields.get("timeframe_raw"),
         }
+        # Drop None exchange so older schemas without the column still work
+        # if PostgREST rejects unknown cols — keep it when set.
+        if row.get("exchange") is None:
+            row.pop("exchange", None)
         data = self._request(
             "POST",
             "trades",
@@ -114,7 +119,7 @@ class SupabaseStore:
         self._request(
             "PATCH",
             "trades",
-            query={"id": f"eq.{trade_id}"},
+            query={"id": f"eq.{trade_id}", "status": "eq.open"},
             body={
                 "status": status,
                 "exit_price": exit_price,
@@ -287,6 +292,7 @@ class SupabaseStore:
         *,
         source: str | None = None,
         closed_only: bool = True,
+        channel_key: str | None = None,
     ) -> list[TradeRow]:
         # PostgREST and-filters
         params: dict[str, str] = {
@@ -306,6 +312,8 @@ class SupabaseStore:
         }
         if source:
             params["source"] = f"eq.{source}"
+        if channel_key:
+            params["channel_key"] = f"eq.{channel_key}"
         if closed_only:
             params["status"] = "neq.open"
             params["closed_at"] = f"not.is.null"
@@ -340,7 +348,71 @@ class SupabaseStore:
             return None
         return float(rows[0]["equity"])
 
-    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+    def latest_equity_baseline(
+        self, *, source: str = "live", note_prefix: str = "roi_baseline"
+    ) -> tuple[datetime, float] | None:
+        rows = self._request(
+            "GET",
+            "equity_snapshots",
+            query={
+                "select": "equity,ts",
+                "source": f"eq.{source}",
+                "note": f"like.{note_prefix}*",
+                "order": "ts.desc",
+                "limit": "1",
+            },
+        ) or []
+        if not rows:
+            return None
+        ts = datetime.fromisoformat(str(rows[0]["ts"]).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc), float(rows[0]["equity"])
+
+    def reset_roi_baseline(
+        self,
+        equity: float,
+        *,
+        source: str = "live",
+        close_open_trades: bool = True,
+        clear_prior_snapshots: bool = True,
+    ) -> dict[str, int]:
+        closed = 0
+        deleted = 0
+        now = _utc_now()
+        if close_open_trades:
+            opens = self.list_open_trades(source=source, limit=500)
+            for t in opens:
+                self.close_trade(
+                    t.id,
+                    status="canceled",
+                    exit_price=float(t.entry or 0),
+                    exit_reason="roi_fresh_start",
+                    pnl=0.0,
+                    r_multiple=0.0,
+                )
+                closed += 1
+        if clear_prior_snapshots:
+            # Best-effort: delete via filter (PostgREST).
+            try:
+                self._request(
+                    "DELETE",
+                    "equity_snapshots",
+                    query={"source": f"eq.{source}"},
+                )
+                deleted = -1  # unknown count via REST
+            except Exception:
+                pass
+        self.snapshot_equity(equity, source=source, note="roi_baseline")
+        return {"closed_opens": closed, "deleted_snapshots": deleted}
+
+    def list_open_trades(
+        self,
+        *,
+        source: str | None = "live",
+        limit: int = 20,
+        channel_key: str | None = None,
+    ) -> list[TradeRow]:
         query: dict[str, str] = {
             "select": "*",
             "status": "eq.open",
@@ -349,6 +421,8 @@ class SupabaseStore:
         }
         if source:
             query["source"] = f"eq.{source}"
+        if channel_key:
+            query["channel_key"] = f"eq.{channel_key}"
         rows = self._request("GET", "trades", query=query) or []
         return [self._row(r) for r in rows]
 
@@ -376,10 +450,9 @@ class SupabaseStore:
             window_start=r.get("window_start"),
             window_end=r.get("window_end"),
             timeframe_raw=r.get("timeframe_raw"),
+            channel_key=r.get("channel_key"),
+            exchange=r.get("exchange"),
         )
-
-
-class PostgresStore:
     """Direct Postgres via DATABASE_URL (Supabase connection string)."""
 
     def __init__(self, database_url: str) -> None:
@@ -401,6 +474,7 @@ class PostgresStore:
         cols = {
             "source": fields.get("source", "live"),
             "channel_key": fields.get("channel_key"),
+            "exchange": fields.get("exchange"),
             "pair": fields["pair"],
             "symbol": fields["symbol"],
             "side": fields["side"],
@@ -421,6 +495,8 @@ class PostgresStore:
             "window_end": _iso(fields.get("window_end")),
             "timeframe_raw": fields.get("timeframe_raw"),
         }
+        if cols.get("exchange") is None:
+            cols.pop("exchange", None)
         names = ", ".join(cols)
         placeholders = ", ".join(f"%({k})s" for k in cols)
         with self._connect() as conn:
@@ -429,7 +505,7 @@ class PostgresStore:
                 cols,
             ).fetchone()
             conn.commit()
-        return int(row["id"])
+            return int(row["id"])
 
     def close_trade(
         self,
@@ -447,7 +523,7 @@ class PostgresStore:
                 UPDATE trades
                 SET status=%s, exit_price=%s, exit_reason=%s,
                     pnl=%s, r_multiple=%s, closed_at=%s
-                WHERE id=%s
+                WHERE id=%s AND status='open'
                 """,
                 (status, exit_price, exit_reason, pnl, r_multiple, _utc_now(), trade_id),
             )
@@ -586,6 +662,7 @@ class PostgresStore:
         *,
         source: str | None = None,
         closed_only: bool = True,
+        channel_key: str | None = None,
     ) -> list[TradeRow]:
         q = """
             SELECT * FROM trades
@@ -599,6 +676,9 @@ class PostgresStore:
         if source:
             q += " AND source=%s"
             params.append(source)
+        if channel_key:
+            q += " AND channel_key=%s"
+            params.append(channel_key)
         if closed_only:
             q += " AND closed_at IS NOT NULL AND status <> 'open'"
         q += " ORDER BY COALESCE(closed_at, opened_at)"
@@ -618,12 +698,81 @@ class PostgresStore:
             ).fetchone()
         return float(row["equity"]) if row else None
 
-    def list_open_trades(self, *, source: str | None = "live", limit: int = 20) -> list[TradeRow]:
+    def latest_equity_baseline(
+        self, *, source: str = "live", note_prefix: str = "roi_baseline"
+    ) -> tuple[datetime, float] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT equity, ts FROM equity_snapshots
+                WHERE source=%s AND note LIKE %s
+                ORDER BY ts DESC LIMIT 1
+                """,
+                (source, f"{note_prefix}%"),
+            ).fetchone()
+        if not row:
+            return None
+        ts = row["ts"]
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc), float(row["equity"])
+
+    def reset_roi_baseline(
+        self,
+        equity: float,
+        *,
+        source: str = "live",
+        close_open_trades: bool = True,
+        clear_prior_snapshots: bool = True,
+    ) -> dict[str, int]:
+        now = _utc_now()
+        closed = 0
+        deleted = 0
+        with self._connect() as conn:
+            if close_open_trades:
+                cur = conn.execute(
+                    """
+                    UPDATE trades
+                    SET status='canceled', exit_reason='roi_fresh_start',
+                        exit_price=COALESCE(entry, 0), pnl=0, r_multiple=0, closed_at=%s
+                    WHERE status='open' AND source=%s
+                    """,
+                    (now, source),
+                )
+                closed = cur.rowcount
+            if clear_prior_snapshots:
+                cur = conn.execute(
+                    "DELETE FROM equity_snapshots WHERE source=%s",
+                    (source,),
+                )
+                deleted = cur.rowcount
+            conn.execute(
+                """
+                INSERT INTO equity_snapshots (source, channel_key, equity, ts, note)
+                VALUES (%s, NULL, %s, %s, %s)
+                """,
+                (source, equity, now, "roi_baseline"),
+            )
+            conn.commit()
+        return {"closed_opens": closed, "deleted_snapshots": deleted}
+
+    def list_open_trades(
+        self,
+        *,
+        source: str | None = "live",
+        limit: int = 20,
+        channel_key: str | None = None,
+    ) -> list[TradeRow]:
         q = "SELECT * FROM trades WHERE status='open'"
         params: list[Any] = []
         if source:
             q += " AND source=%s"
             params.append(source)
+        if channel_key:
+            q += " AND channel_key=%s"
+            params.append(channel_key)
         q += " ORDER BY opened_at DESC LIMIT %s"
         params.append(limit)
         with self._connect() as conn:
@@ -664,6 +813,8 @@ class PostgresStore:
             window_start=_s(r.get("window_start")),
             window_end=_s(r.get("window_end")),
             timeframe_raw=r.get("timeframe_raw"),
+            channel_key=r.get("channel_key"),
+            exchange=r.get("exchange"),
         )
 
 
