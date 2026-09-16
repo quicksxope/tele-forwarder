@@ -150,12 +150,12 @@ def test_resolve_amount_1r_risk() -> None:
         side="buy",
         entry=100.0,
         raw_pair="AAA/USDT",
-        stop_loss=90.0,  # stop_dist=10 → risk 500 → qty 50
+        stop_loss=90.0,  # stop_dist=10 → risk 250 → qty 25
     )
     amt = _resolve_amount(
         ex,
         dry_run=False,
-        equity_pct=10.0,
+        equity_pct=5.0,
         amount=1.0,
         equity_dry_usdt=5000.0,
         signal=sig,
@@ -163,7 +163,7 @@ def test_resolve_amount_1r_risk() -> None:
         symbol="AAA/USDT:USDT",
         exchange_label="binance",
     )
-    assert abs(amt - 50.0) < 1e-6
+    assert abs(amt - 25.0) < 1e-6
 
 
 def test_resolve_amount_1r_dry_run() -> None:
@@ -173,12 +173,12 @@ def test_resolve_amount_1r_dry_run() -> None:
         side="buy",
         entry=50.0,
         raw_pair="AAA/USDT",
-        stop_loss=40.0,  # dist=10; risk=500 → qty 50
+        stop_loss=40.0,  # dist=10; risk=250 → qty 25
     )
     amt = _resolve_amount(
         ex,
         dry_run=True,
-        equity_pct=10.0,
+        equity_pct=5.0,
         amount=1.0,
         equity_dry_usdt=5000.0,
         signal=sig,
@@ -186,30 +186,30 @@ def test_resolve_amount_1r_dry_run() -> None:
         symbol="AAA/USDT:USDT",
         exchange_label="binance",
     )
-    assert abs(amt - 50.0) < 1e-6
+    assert abs(amt - 25.0) < 1e-6
 
 
-def test_resolve_amount_caps_tight_stop_for_margin() -> None:
-    """YFI-like: 1R wants huge notional; must fit free×0.85 margin at lev."""
+def test_resolve_amount_skips_when_margin_too_small() -> None:
+    """Tight SL needs more margin than free — skip, do not shrink below 1R."""
+    import pytest
+
     ex = _FakeEqExchange(3000.0)
     sig = Signal(
         pair="AAA/USDT",
         side="sell",
         entry=2100.0,
         raw_pair="AAA/USDT",
-        stop_loss=2116.0,  # dist=16 → raw 1R qty = 300/16 = 18.75
+        stop_loss=2108.0,  # dist=8 → risk 150 → notional 39375 > max 25500
     )
-    amt = _resolve_amount(
-        ex,
-        dry_run=False,
-        equity_pct=10.0,
-        amount=1.0,
-        equity_dry_usdt=3000.0,
-        signal=sig,
-        leverage=10,
-        symbol="AAA/USDT:USDT",
-        exchange_label="binance",
-    )
-    # max_margin = 3000*0.85=2550; max_notional=25500; qty=25500/2100≈12.14
-    assert amt < 18.0
-    assert abs(amt * 2100.0 / 10.0 - 2550.0) < 1.0
+    with pytest.raises(ValueError, match="skip — full 1R"):
+        _resolve_amount(
+            ex,
+            dry_run=False,
+            equity_pct=5.0,
+            amount=1.0,
+            equity_dry_usdt=3000.0,
+            signal=sig,
+            leverage=10,
+            symbol="AAA/USDT:USDT",
+            exchange_label="binance",
+        )

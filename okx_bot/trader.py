@@ -282,8 +282,8 @@ def _resolve_amount(
 ) -> float:
     """Fixed amount, or % of USDT equity as 1R risk when equity_pct > 0.
 
-    Caps qty so required margin (notional/leverage) fits in free USDT × 0.85,
-    otherwise Binance returns -2019 on tight stops that inflate notional.
+    Full 1R only — if required margin exceeds free×0.85, skip (do not shrink).
+    Example: equity 5000 × 5% → risk 250 USDT at SL; qty = 250 / |entry−SL|.
     """
     if equity_pct <= 0:
         raw = amount
@@ -324,35 +324,25 @@ def _resolve_amount(
                     f"(free={free:.4f}, total={equity:.4f})"
                 )
             if notional > max_notional and entry > 0:
-                capped = max_notional / entry
-                eff_risk = capped * stop_dist
-                logger.warning(
-                    "1R size capped for margin: notional %.2f → %.2f "
-                    "(free %.2f × %.0f%% util × %sx); "
-                    "target risk %.2f → effective %.2f USDT; qty %s → %s",
-                    notional,
-                    max_notional,
-                    free,
-                    _MARGIN_UTILIZATION * 100,
-                    leverage,
-                    risk_usdt,
-                    eff_risk,
-                    raw,
-                    capped,
+                need_margin = notional / max(leverage, 1)
+                raise ValueError(
+                    f"{exchange_label}: skip — full 1R needs margin "
+                    f"~{need_margin:.2f} USDT but free×{_MARGIN_UTILIZATION:.0%}="
+                    f"{max_margin:.2f} (target risk {risk_usdt:.2f}, "
+                    f"notional {notional:.2f}). Close positions or lower "
+                    f"TRADE_EQUITY_PCT."
                 )
-                raw = capped
-            else:
-                logger.info(
-                    "Size from 1R risk: equity %.2f free %.2f × %.1f%% "
-                    "= %.2f risk / stop_dist %s = %s (notional %.2f)",
-                    equity,
-                    free,
-                    equity_pct,
-                    risk_usdt,
-                    stop_dist,
-                    raw,
-                    notional,
-                )
+            logger.info(
+                "Size from 1R risk: equity %.2f free %.2f × %.1f%% "
+                "= %.2f risk / stop_dist %s = %s (notional %.2f)",
+                equity,
+                free,
+                equity_pct,
+                risk_usdt,
+                stop_dist,
+                raw,
+                notional,
+            )
     return _finalize_amount(
         exchange, symbol, raw, dry_run=dry_run, price=signal.entry
     )
