@@ -5,20 +5,33 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from telethon import Button, TelegramClient, events
 
 from .crypto import decrypt, encrypt
+from .desk_view import (
+    ClosedRow,
+    HistoryBlock,
+    WalletView,
+    classify_book,
+    format_book,
+    format_desk,
+    format_history,
+    format_today,
+    norm_sym,
+    wallet_from_balance,
+)
 from .exchange_runtime import (
     SUPPORTED_EXCHANGES,
     format_enabled_line,
     load_enabled,
     toggle_exchange,
 )
-from .metrics import compute_metrics
-from .trader import BinanceTrader, BybitTrader, OkxTrader
+from .metrics import _is_win, compute_metrics
+from .risk_limits import day_bounds_wib
+from .trader import BinanceTrader, BybitTrader, OkxTrader, _fetch_mark_price
 from .weekly_report import period_bounds, period_bounds_today_wib
 
 logger = logging.getLogger("okx_bot.settings")
@@ -42,18 +55,42 @@ class WizardState:
 def _main_keyboard() -> list[list[Any]]:
     return [
         [
-            Button.inline("💼 Assets", b"menu:assets"),
-            Button.inline("📍 Positions", b"menu:positions"),
+            Button.inline("Book", b"menu:book"),
+            Button.inline("Today", b"menu:today"),
         ],
         [
-            Button.inline("📈 PnL", b"menu:pnl"),
-            Button.inline("📉 ROI", b"menu:roi"),
+            Button.inline("History", b"menu:history"),
+            Button.inline("Settings", b"menu:settings"),
         ],
+    ]
+
+
+def _settings_keyboard() -> list[list[Any]]:
+    return [
         [Button.inline("🔑 Set API Key", b"menu:set")],
         [Button.inline("📋 My Keys", b"menu:list"), Button.inline("🗑 Delete Key", b"menu:del")],
         [Button.inline("🔌 Test Connection", b"menu:test"), Button.inline("📊 Status", b"menu:status")],
         [Button.inline("⚙️ Venue ON/OFF", b"menu:venues")],
+        [Button.inline("Menu", b"menu:main")],
     ]
+
+
+def _filter_keyboard(prefix: str, channels, selected: str | None) -> list[list[Any]]:
+    def label(key: str, text: str) -> str:
+        on = (selected is None and key == "all") or selected == key
+        return f"✓ {text}" if on else text
+
+    rows: list[list[Any]] = [[Button.inline(label("all", "All"), f"{prefix}:all".encode())]]
+    row: list[Any] = []
+    for c in channels or []:
+        row.append(Button.inline(label(c.key, c.key), f"{prefix}:{c.key}".encode()))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([Button.inline("Menu", b"menu:main")])
+    return rows
 
 
 def _venues_keyboard(rt_path, cfg: dict) -> list[list[Any]]:
@@ -74,7 +111,7 @@ def _venues_keyboard(rt_path, cfg: dict) -> list[list[Any]]:
 
 
 def _back_keyboard() -> list[list[Any]]:
-    return [[Button.inline("« Menu", b"menu:main"), Button.inline("✕ Cancel", b"menu:cancel")]]
+    return [[Button.inline("Menu", b"menu:main"), Button.inline("Cancel", b"menu:cancel")]]
 
 
 def _exchange_keyboard(prefix: str) -> list[list[Any]]:
@@ -507,12 +544,6 @@ def _roi_text(
         except Exception:
             logger.exception("latest_equity_baseline failed")
 
-    if channel_key is None and live_equity is not None and hasattr(store, "snapshot_equity"):
-        try:
-            store.snapshot_equity(live_equity, source="live", note="roi_menu")
-        except Exception:
-            logger.exception("snapshot_equity failed")
-
     if baseline:
         b_ts, b_eq = baseline
         chunks.append(
@@ -663,6 +694,219 @@ def test_exchange_connection(
     return f"{exchange.upper()} {mode} OK — USDT free={free} total={total}"
 
 
+def _clip(text: str) -> str:
+    if len(text) > 4000:
+        return text[:3990] + "\n…"
+    return text
+
+
+def _maybe_snapshot(store, equity: float | None) -> None:
+    if equity is None or not hasattr(store, "snapshot_equity"):
+        return
+    try:
+        store.snapshot_equity(float(equity), source="live", note="roi_menu")
+    except Exception:
+        logger.exception("snapshot_equity failed")
+
+
+def _load_wallet(traders: list[tuple[str, Any]]) -> WalletView:
+    equity = free = locked = 0.0
+    saw = False
+    label = "Equity"
+    for _, trader in traders:
+        if getattr(trader, "dry_run", False):
+            dry = float(getattr(trader, "equity_dry_usdt", 0) or 0)
+            return WalletView(equity=dry, free=dry, locked=0.0, label="Equity")
+        exchange = getattr(trader, "exchange", None)
+        if exchange is None:
+            continue
+        try:
+            balance = exchange.fetch_balance()
+        except Exception:
+            logger.exception("desk balance failed")
+            continue
+        view = wallet_from_balance(balance)
+        saw = True
+        if view.label == "Wallet":
+            label = "Wallet"
+        if view.equity is not None:
+            equity += view.equity
+        if view.free is not None:
+            free += view.free
+        if view.locked is not None:
+            locked += view.locked
+    if not saw:
+        return WalletView(equity=None, free=None, locked=None, label="Equity")
+    return WalletView(equity=equity, free=free, locked=locked, label=label)
+
+
+def _venue_line(traders: list[tuple[str, Any]], *, dry_run: bool) -> str:
+    if not traders:
+        return "No venue"
+    parts: list[str] = []
+    for name, trader in traders:
+        if getattr(trader, "demo", False):
+            mode = "demo"
+        elif getattr(trader, "sandbox", False):
+            mode = "sandbox"
+        else:
+            mode = "live"
+        bit = f"{str(name).upper()} · {mode}"
+        if dry_run or getattr(trader, "dry_run", False):
+            bit += " · dry-run"
+        parts.append(bit)
+    return "\n".join(parts)
+
+
+def _load_book(store, traders: list[tuple[str, Any]]):
+    trades: list[Any] = []
+    if hasattr(store, "list_open_trades"):
+        try:
+            trades = list(store.list_open_trades(source="live", limit=50))
+        except Exception:
+            logger.exception("desk open trades failed")
+            trades = []
+    positions: list[dict] = []
+    for _, trader in traders:
+        if not hasattr(trader, "fetch_open_positions"):
+            continue
+        try:
+            positions.extend(trader.fetch_open_positions() or [])
+        except Exception:
+            logger.exception("desk positions failed")
+    pos_syms = {norm_sym(p.get("symbol")) for p in positions}
+    orders: dict[str, dict] = {}
+    for ex_name, trader in traders:
+        if not hasattr(trader, "fetch_order"):
+            continue
+        for trade in trades:
+            ex = (getattr(trade, "exchange", None) or "").lower()
+            if ex and ex != str(ex_name).lower():
+                continue
+            key = norm_sym(getattr(trade, "symbol", None) or getattr(trade, "pair", None))
+            order_id = getattr(trade, "order_id", None)
+            if not key or key in pos_syms or not order_id:
+                continue
+            try:
+                orders[str(order_id)] = trader.fetch_order(
+                    str(order_id), trade.symbol or trade.pair
+                )
+            except Exception:
+                logger.exception("desk fetch_order failed")
+    book = classify_book(positions, trades, orders)
+    marks: dict[str, float] = {}
+    for _, trader in traders:
+        exchange = getattr(trader, "exchange", None)
+        if exchange is None:
+            continue
+        for limit in book.limits:
+            key = norm_sym(limit.symbol)
+            if key in marks:
+                continue
+            try:
+                px = _fetch_mark_price(exchange, limit.symbol)
+            except Exception:
+                px = None
+            if px is not None:
+                marks[key] = float(px)
+    if marks:
+        book = classify_book(positions, trades, orders, marks)
+    return book
+
+
+def _account_r(store) -> float | None:
+    if not hasattr(store, "realized_r_between"):
+        return None
+    start, end = day_bounds_wib()
+    try:
+        return float(store.realized_r_between(start, end))
+    except Exception:
+        logger.exception("today R failed")
+        return None
+
+
+def _cash_between(traders: list[tuple[str, Any]], start: datetime, end: datetime) -> float | None:
+    total = 0.0
+    any_ok = False
+    for _, trader in traders:
+        if not hasattr(trader, "fetch_realized_pnl"):
+            continue
+        try:
+            row = trader.fetch_realized_pnl(since=start, until=end)
+        except TypeError:
+            continue
+        except Exception:
+            logger.exception("realized pnl failed")
+            continue
+        total += float(row.get("total") or 0)
+        any_ok = True
+    return total if any_ok else None
+
+
+def _closed_stats(store, start: datetime, end: datetime, channel_key: str | None):
+    if not hasattr(store, "trades_between"):
+        return 0.0, 0, 0, []
+    try:
+        trades = store.trades_between(
+            start, end, source="live", closed_only=True, channel_key=channel_key
+        )
+    except Exception:
+        logger.exception("trades_between failed")
+        return 0.0, 0, 0, []
+    metrics = compute_metrics(trades, start=start, end=end)
+    rows = [
+        ClosedRow(pair=t.pair, status=t.status or "", r_multiple=t.r_multiple)
+        for t in trades
+        if _is_win(t) is not None
+    ]
+    return metrics.total_r, metrics.n_wins, metrics.n_losses, rows
+
+
+def _history_text(store, traders, wallet: WalletView, channel_key: str | None, now: datetime) -> str:
+    today_start, today_end = day_bounds_wib(now)
+    week_start = now - timedelta(days=7)
+    baseline = None
+    if hasattr(store, "latest_equity_baseline"):
+        try:
+            baseline = store.latest_equity_baseline(source="live")
+        except Exception:
+            logger.exception("baseline failed")
+    spans = (
+        ("Today", today_start, today_end),
+        ("7 days", week_start, now + timedelta(seconds=1)),
+    )
+    blocks: list[HistoryBlock] = []
+    for label, start, end in spans:
+        total_r, wins, losses, _rows = _closed_stats(store, start, end, channel_key)
+        cash = None if channel_key else _cash_between(traders, start, end)
+        blocks.append(
+            HistoryBlock(label=label, total_r=total_r, wins=wins, losses=losses, cash=cash)
+        )
+    baseline_eq = baseline_at = None
+    if baseline:
+        baseline_at, baseline_eq = baseline
+        total_r, wins, losses, _rows = _closed_stats(
+            store, baseline_at, now + timedelta(seconds=1), channel_key
+        )
+        cash = None if channel_key else _cash_between(traders, baseline_at, now)
+        blocks.append(
+            HistoryBlock(
+                label="Since baseline",
+                total_r=total_r,
+                wins=wins,
+                losses=losses,
+                cash=cash,
+            )
+        )
+    return format_history(
+        blocks=blocks,
+        baseline_equity=baseline_eq,
+        baseline_at=baseline_at,
+        live_equity=wallet.equity,
+        channel_key=channel_key,
+    )
+
+
 def register_settings_menu(
     bot_client: TelegramClient,
     *,
@@ -696,25 +940,69 @@ def register_settings_menu(
         name = getattr(trader, "exchange_name", exchange) or exchange
         return [(str(name).lower(), trader)]
 
-    async def _show_main(event, *, edit: bool = False) -> None:
-        text = _menu_text(
-            channel=channel,
-            signal_chat=signal_chat,
-            dry_run=dry_run,
-            sandbox=sandbox,
-            exchange=exchange,
-            watch_channels=channels,
-            rt_path=rt_path,
-            cfg=cfg,
+    def _desk_text() -> str:
+        traders = _traders_for_live()
+        wallet = _load_wallet(traders)
+        book = _load_book(store, traders)
+        _maybe_snapshot(store, wallet.equity)
+        now = datetime.now(timezone.utc)
+        return format_desk(
+            now=now,
+            wallet=wallet,
+            today_r=_account_r(store),
+            limit_r=float(cfg.get("DAILY_LOSS_R", "5")),
+            slots=len(book.symbols),
+            max_slots=int(cfg.get("MAX_OPEN_POSITIONS", "6")),
+            book=book,
+            venue_line=_venue_line(traders, dry_run=dry_run),
         )
+
+    def _book_text(channel_key: str | None) -> str:
+        traders = _traders_for_live()
+        book = _load_book(store, traders)
+        return format_book(
+            book,
+            now=datetime.now(timezone.utc),
+            invalid_r=float(cfg.get("PREFILL_INVALID_R", "0.3")),
+            channel_key=channel_key,
+        )
+
+    def _today_text(channel_key: str | None) -> str:
+        traders = _traders_for_live()
+        now = datetime.now(timezone.utc)
+        start, end = day_bounds_wib(now)
+        total_r, wins, losses, rows = _closed_stats(store, start, end, channel_key)
+        realized = total_r if channel_key else _account_r(store)
+        cash = None if channel_key else _cash_between(traders, start, end)
+        return format_today(
+            now=now,
+            realized_r=realized,
+            limit_r=float(cfg.get("DAILY_LOSS_R", "5")),
+            wins=wins,
+            losses=losses,
+            rows=rows,
+            cash=cash,
+            channel_key=channel_key,
+        )
+
+    def _history_screen(channel_key: str | None) -> str:
+        traders = _traders_for_live()
+        wallet = _load_wallet(traders)
+        _maybe_snapshot(store, wallet.equity)
+        return _history_text(
+            store, traders, wallet, channel_key, datetime.now(timezone.utc)
+        )
+
+    async def _show_main(event, *, edit: bool = False) -> None:
+        text = await asyncio.to_thread(_desk_text)
         buttons = _main_keyboard()
         if edit and hasattr(event, "edit"):
             try:
-                await event.edit(text, buttons=buttons)
+                await event.edit(_clip(text), buttons=buttons)
                 return
             except Exception:
                 pass
-        await event.respond(text, buttons=buttons)
+        await event.respond(_clip(text), buttons=buttons)
 
     async def _list_keys(event, *, edit: bool = False) -> None:
         if not hasattr(store, "list_credentials"):
@@ -834,81 +1122,51 @@ def register_settings_menu(
             await _list_keys(event, edit=True)
             return
 
-        if data == "menu:assets":
+        legacy = {
+            "menu:assets": "menu:book",
+            "menu:positions": "menu:book",
+            "menu:pnl": "menu:history",
+            "menu:roi": "menu:history",
+        }
+        if data in legacy:
+            data = legacy[data]
+        elif data.startswith(("assets:", "pos:")):
+            data = "book:" + data.split(":", 1)[1]
+        elif data.startswith(("pnl:", "roi:")):
+            data = "history:" + data.split(":", 1)[1]
+
+        if data == "menu:settings":
+            await event.edit("Settings", buttons=_settings_keyboard())
+            return
+
+        if data == "menu:book" or data.startswith("book:"):
+            key = None if data == "menu:book" else data.split(":", 1)[1]
+            channel_key = None if not key or key == "all" else key
+            await event.edit("Loading…")
+            text = await asyncio.to_thread(_book_text, channel_key)
             await event.edit(
-                "Assets — pilih channel:",
-                buttons=_channel_filter_keyboard("assets", channels),
+                _clip(text), buttons=_filter_keyboard("book", channels, channel_key)
             )
             return
 
-        if data.startswith("assets:"):
-            key = data.split(":", 1)[1]
-            channel_key = None if key == "all" else key
-            await event.edit("⏳ Loading assets…")
-            text = await asyncio.to_thread(
-                _assets_text, store, trader, cfg, channel_key=channel_key
-            )
-            await event.edit(text, buttons=_back_keyboard())
-            return
-
-        if data == "menu:positions":
+        if data == "menu:today" or data.startswith("today:"):
+            key = None if data == "menu:today" else data.split(":", 1)[1]
+            channel_key = None if not key or key == "all" else key
+            await event.edit("Loading…")
+            text = await asyncio.to_thread(_today_text, channel_key)
             await event.edit(
-                "Positions — pilih channel:",
-                buttons=_channel_filter_keyboard("pos", channels),
+                _clip(text), buttons=_filter_keyboard("today", channels, channel_key)
             )
             return
 
-        if data.startswith("pos:"):
-            key = data.split(":", 1)[1]
-            channel_key = None if key == "all" else key
-            await event.edit("⏳ Loading positions…")
-            traders = await asyncio.to_thread(_traders_for_live)
-            text = await asyncio.to_thread(
-                _positions_text, store, traders, channel_key=channel_key
-            )
-            if len(text) > 4000:
-                text = text[:3990] + "\n…"
-            await event.edit(text, buttons=_back_keyboard())
-            return
-
-        if data == "menu:pnl":
+        if data == "menu:history" or data.startswith("history:"):
+            key = None if data == "menu:history" else data.split(":", 1)[1]
+            channel_key = None if not key or key == "all" else key
+            await event.edit("Loading…")
+            text = await asyncio.to_thread(_history_screen, channel_key)
             await event.edit(
-                "PnL — pilih channel:",
-                buttons=_channel_filter_keyboard("pnl", channels),
+                _clip(text), buttons=_filter_keyboard("history", channels, channel_key)
             )
-            return
-
-        if data.startswith("pnl:"):
-            key = data.split(":", 1)[1]
-            channel_key = None if key == "all" else key
-            await event.edit("⏳ Loading PnL…")
-            traders = await asyncio.to_thread(_traders_for_live)
-            text = await asyncio.to_thread(
-                _pnl_text, store, channel_key=channel_key, traders=traders
-            )
-            if len(text) > 4000:
-                text = text[:3990] + "\n…"
-            await event.edit(text, buttons=_back_keyboard())
-            return
-
-        if data == "menu:roi":
-            await event.edit(
-                "ROI — pilih channel:",
-                buttons=_channel_filter_keyboard("roi", channels),
-            )
-            return
-
-        if data.startswith("roi:"):
-            key = data.split(":", 1)[1]
-            channel_key = None if key == "all" else key
-            await event.edit("⏳ Loading ROI…")
-            traders = await asyncio.to_thread(_traders_for_live)
-            text = await asyncio.to_thread(
-                _roi_text, store, channel_key=channel_key, traders=traders
-            )
-            if len(text) > 4000:
-                text = text[:3990] + "\n…"
-            await event.edit(text, buttons=_back_keyboard())
             return
 
         if data == "menu:venues":

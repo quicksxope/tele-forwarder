@@ -4,13 +4,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from okx_bot.settings_menu import _roi_text
+from okx_bot.desk_view import HistoryBlock, format_history
+from okx_bot.settings_menu import _history_text, _load_wallet
 from okx_bot.weekly_report import period_bounds_today_wib
 
 
 @dataclass
 class _FakeTrade:
     id: int = 1
+    pair: str = "AAA/USDT"
     closed_at: datetime | None = None
     pnl: float | None = 10.0
     r_multiple: float | None = None
@@ -67,10 +69,30 @@ def test_period_bounds_today_wib_starts_at_midnight() -> None:
     assert end > start
 
 
-def test_roi_text_uses_baseline_not_n_a() -> None:
+def test_history_uses_baseline_not_old_income() -> None:
     store = _FakeStore()
-    text = _roi_text(store, traders=[("binance", _FakeTrader())])
-    assert "Baseline ROI: 5000.0000 USDT" in text
-    assert "Hari ini (WIB)" in text
-    assert "Sejak baseline" in text
-    assert "n/a" not in text.split("ROI:")[1].split("\n")[0]
+    trader = _FakeTrader()
+
+    def fetch_realized_pnl(*, days=7, since=None, until=None):
+        return {"total": 10.0, "count": 1}
+
+    trader.fetch_realized_pnl = fetch_realized_pnl
+    wallet = _load_wallet([("binance", trader)])
+    assert wallet.equity == 5000.0
+    text = _history_text(
+        store,
+        [("binance", trader)],
+        wallet,
+        None,
+        datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc),
+    )
+    assert "Since baseline" in text
+    assert "5,000 → 5,000" in text
+    assert "No baseline" not in text
+    assert store.snaps == []
+    plain = format_history(
+        blocks=[HistoryBlock("Today", 0.0, 0, 0, None)],
+        baseline_equity=5000,
+        live_equity=1046,
+    )
+    assert "-79%" in plain

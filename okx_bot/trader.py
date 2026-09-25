@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Protocol
+from datetime import datetime
+from typing import Any, Callable, Protocol
 
 import ccxt
 
 from .parser import Signal
+from .risk_limits import split_order_qty
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,55 @@ _BINANCE_CCXT_OPTIONS = {
     "defaultType": "future",
     "fetchMarkets": ["linear"],
 }
+
+
+def _collect_income_pages(
+    fetch: Callable[[dict[str, Any]], Any],
+    *,
+    start_ms: int,
+    end_ms: int | None = None,
+    max_pages: int = 8,
+) -> list[dict[str, Any]]:
+    """Page Binance income until a short page. Dedupe by tranId so overlaps are not double-counted."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    cursor = int(start_ms)
+    for _ in range(max_pages):
+        params: dict[str, Any] = {
+            "incomeType": "REALIZED_PNL",
+            "startTime": cursor,
+            "limit": 1000,
+        }
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+        rows = fetch(params) or []
+        if isinstance(rows, dict):
+            break
+        if not rows:
+            break
+        added = 0
+        last_time = cursor
+        for row in rows:
+            tid = str(row.get("tranId") or "")
+            key = tid or f"{row.get('time')}:{row.get('symbol')}:{row.get('income')}:{added}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+            added += 1
+            try:
+                last_time = max(last_time, int(row.get("time") or 0))
+            except (TypeError, ValueError):
+                pass
+        if len(rows) < 1000:
+            break
+        nxt = last_time if last_time > cursor else cursor + 1
+        if nxt <= cursor:
+            nxt = cursor + 1
+        cursor = nxt
+        if added == 0:
+            break
+    return out
 
 
 def _binance_load_markets(exchange: ccxt.Exchange) -> None:
@@ -752,6 +803,85 @@ class BinanceTrader:
             pass
         return False
 
+    def _max_order_qty(self, symbol: str) -> float | None:
+        try:
+            market = self.exchange.market(symbol)
+        except Exception:
+            market = (self.exchange.markets or {}).get(symbol) or {}
+        max_a = ((market.get("limits") or {}).get("amount") or {}).get("max")
+        if max_a is None:
+            return None
+        try:
+            max_f = float(max_a)
+        except (TypeError, ValueError):
+            return None
+        return max_f if max_f > 0 else None
+
+    def _place_tp_cover(
+        self,
+        symbol: str,
+        signal: Signal,
+        amount: float,
+        *,
+        close_side: str,
+        reduce_params: dict[str, Any],
+        placed: list[str],
+        skipped: list[str],
+    ) -> None:
+        """Place take-profit for the whole qty. Naked remainder is market-closed."""
+        if signal.take_profit is None or amount <= 0:
+            return
+        stop = float(self.exchange.price_to_precision(symbol, signal.take_profit))
+        chunks = split_order_qty(amount, self._max_order_qty(symbol))
+        covered = 0.0
+        n_orders = 0
+        for raw in chunks:
+            try:
+                qty = float(self.exchange.amount_to_precision(symbol, raw))
+            except Exception:
+                qty = raw
+            if qty <= 0:
+                continue
+            try:
+                self.exchange.create_order(
+                    symbol,
+                    "TAKE_PROFIT_MARKET",
+                    close_side,
+                    qty,
+                    None,
+                    {**reduce_params, "stopPrice": stop},
+                )
+            except Exception as e:
+                logger.warning("Binance tp chunk failed: %s", e)
+                break
+            covered += qty
+            n_orders += 1
+        if n_orders:
+            placed.append(f"TP({n_orders})" if n_orders > 1 else "TP")
+        leftover = amount - covered
+        try:
+            dust = _market_min_amount(self.exchange, symbol)
+        except Exception:
+            dust = 0.0
+        if leftover <= max(dust, 0.0) * 1.01:
+            if not n_orders:
+                skipped.append("TP")
+            return
+        try:
+            qty = float(self.exchange.amount_to_precision(symbol, leftover))
+        except Exception:
+            qty = leftover
+        if qty <= 0:
+            return
+        try:
+            self.exchange.create_order(
+                symbol, "market", close_side, qty, None, {**reduce_params}
+            )
+            placed.append("NAKED→MARKET")
+        except Exception as e:
+            logger.warning("Naked remainder close failed: %s", e)
+            skipped.append(f"TP({e})")
+
     def _place_binance_protective_orders(
         self,
         symbol: str,
@@ -900,11 +1030,42 @@ class BinanceTrader:
                 logger.warning("Binance %s order failed: %s", kind, e)
                 skipped.append(f"{kind.upper()}({e})")
 
-        # SL first with close-all; TP with sized qty (second close-all would be rejected).
+        # Price already through TP: a resting TP would be rejected. Take the win.
+        if (
+            signal.take_profit is not None
+            and mark is not None
+            and not _binance_exit_trigger_valid(
+                entry_side=signal.side,
+                mark=mark,
+                trigger=signal.take_profit,
+                kind="tp",
+            )
+        ):
+            try:
+                self.exchange.create_order(
+                    symbol, "market", close_side, amount, None, {**reduce_params}
+                )
+                return (
+                    f"TP already through (mark {mark} vs TP {signal.take_profit}) "
+                    "— closed market"
+                )
+            except Exception as e:
+                logger.warning("Take-profit market close failed: %s", e)
+                return f"TP already through but close failed: {e}"
+
+        # SL first with close-all; TP covers the full qty (split if above max lot).
         if signal.stop_loss is not None:
             _place("sl", "STOP_MARKET", signal.stop_loss, close_all=True)
         if signal.take_profit is not None:
-            _place("tp", "TAKE_PROFIT_MARKET", signal.take_profit, close_all=False)
+            self._place_tp_cover(
+                symbol,
+                signal,
+                amount,
+                close_side=close_side,
+                reduce_params=reduce_params,
+                placed=placed,
+                skipped=skipped,
+            )
 
         if placed and not skipped:
             return f"TP/SL: {', '.join(placed)} placed"
@@ -1040,22 +1201,30 @@ class BinanceTrader:
         _binance_load_markets(self.exchange)
         return _normalize_positions(self.exchange.fetch_positions())
 
-    def fetch_realized_pnl(self, *, days: int = 7) -> dict[str, Any]:
-        """Sum REALIZED_PNL income from Binance futures over the last N days."""
+    def fetch_realized_pnl(
+        self,
+        *,
+        days: int = 7,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Sum REALIZED_PNL income. `since`/`until` override the rolling `days` window."""
         if self.dry_run:
             return {"days": days, "total": 0.0, "by_symbol": {}, "count": 0}
         _binance_load_markets(self.exchange)
-        since_ms = int((time.time() - max(1, days) * 86400) * 1000)
-        rows = self.exchange.fapiPrivateGetIncome(
-            {
-                "incomeType": "REALIZED_PNL",
-                "startTime": since_ms,
-                "limit": 1000,
-            }
+        if since is not None:
+            start_ms = int(since.timestamp() * 1000)
+        else:
+            start_ms = int((time.time() - max(1, days) * 86400) * 1000)
+        end_ms = int(until.timestamp() * 1000) if until is not None else None
+        rows = _collect_income_pages(
+            self.exchange.fapiPrivateGetIncome,
+            start_ms=start_ms,
+            end_ms=end_ms,
         )
         total = 0.0
         by_symbol: dict[str, float] = {}
-        for r in rows or []:
+        for r in rows:
             try:
                 income = float(r.get("income") or 0)
             except (TypeError, ValueError):
@@ -1067,7 +1236,7 @@ class BinanceTrader:
             "days": days,
             "total": total,
             "by_symbol": by_symbol,
-            "count": len(rows or []),
+            "count": len(rows),
         }
 
 

@@ -184,6 +184,26 @@ class TradeStore:
                 params,
             )
 
+    def realized_r_between(
+        self, start: datetime, end: datetime, *, source: str = "live"
+    ) -> float:
+        """Sum r_multiple of trades closed in [start, end)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(r_multiple), 0)
+                FROM trades
+                WHERE source=? AND r_multiple IS NOT NULL
+                  AND closed_at>=? AND closed_at<?
+                """,
+                (
+                    source,
+                    start.astimezone(timezone.utc).isoformat(),
+                    end.astimezone(timezone.utc).isoformat(),
+                ),
+            ).fetchone()
+        return float(row[0] or 0)
+
     def snapshot_equity(self, equity: float, *, source: str = "live", note: str = "") -> None:
         with self._connect() as conn:
             conn.execute(
