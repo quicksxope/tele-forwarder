@@ -5,7 +5,8 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -13,10 +14,42 @@ from telethon import TelegramClient, events
 
 from .channels import get_active_channel, list_enabled_channels, match_channel
 from .crypto import decrypt, encrypt
+from .desk_view import entry_still_working as _entry_still_working
+from .desk_view import norm_sym as _norm_trade_sym
+from .notify_text import (
+    cancel_failed as _dm_cancel_failed,
+    canceled as _dm_canceled,
+    closed as _dm_closed,
+    failed_outcome,
+    filled as _dm_filled,
+    orphan_position as _dm_orphan,
+    placed_outcome,
+    signal_notice,
+    skip_outcome,
+    sl_still_open as _dm_sl_open,
+)
+from .exchange_runtime import (
+    enabled_exchange_names,
+    format_enabled_line,
+    load_enabled,
+    runtime_path,
+    toggle_exchange,
+)
 from .parser import Signal
+from .pnl import close_metrics, infer_exit_status, is_position_flat, position_contracts
+from .risk_limits import clamp_to_baseline, daily_loss_hit, day_bounds_wib, prefill_invalidated
 from .settings_menu import register_settings_menu
 from .supabase_store import make_store
-from .trader import OkxTrader, BybitTrader, Trader, make_trader, required_credentials
+from .trader import (
+    BinanceTrader,
+    BybitTrader,
+    OkxTrader,
+    Trader,
+    _fetch_mark_price,
+    make_trader,
+    make_trader_for_exchange,
+    required_credentials,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +99,7 @@ def _cfg() -> dict:
             (
                 "OKX_",
                 "BYBIT_",
+                "BINANCE_",
                 "EXCHANGE",
                 "TELEGRAM_",
                 "SIGNAL_",
@@ -153,13 +187,9 @@ async def _cancel_when_window_ends(
         order = await _run_sync(trader.fetch_order, order_id, symbol)
         status = (order.get("status") or "").lower()
         if status in ("closed", "canceled", "cancelled", "filled", "expired"):
-            msg = (
-                f"ℹ️ Window ended — order already {status}\n"
-                f"Pair: {signal.pair}\n"
-                f"Order ID: {order_id}\n"
-                f"Window: {signal.timeframe_raw or end_utc}"
+            logger.info(
+                "Window ended — order %s already %s", order_id, status
             )
-            await client.send_message(notif_chat, msg)
             return
 
         result = await _run_sync(trader.cancel_order, order_id, symbol)
@@ -174,25 +204,734 @@ async def _cancel_when_window_ends(
                 )
             except Exception:
                 logger.exception("Failed to close trade in store for %s", order_id)
-        msg = (
-            f"⏱ Window ended — order dibatalkan\n"
-            f"Pair: {signal.pair} → {signal.swap_symbol}\n"
-            f"Order ID: {order_id}\n"
-            f"Window: {signal.timeframe_raw or end_utc}\n"
-            f"Status: {result.get('status') or 'canceled'}"
+        await client.send_message(
+            notif_chat, _dm_canceled(signal.pair, "Window ended")
         )
-        await client.send_message(notif_chat, msg)
     except Exception as e:
         logger.exception("Cancel-on-window-end failed for %s", order_id)
         try:
             await client.send_message(
                 notif_chat,
-                f"⚠️ Gagal cancel order saat window habis\n"
-                f"Order ID: {order_id}\n"
-                f"Error: {type(e).__name__}: {e}",
+                _dm_cancel_failed(
+                    pair=signal.pair,
+                    order_id=order_id,
+                    error=f"{type(e).__name__}: {e}",
+                ),
             )
         except Exception:
             pass
+
+
+def _signal_from_trade(t) -> Signal:
+    return Signal(
+        pair=t.pair or "?",
+        side=(t.side or "buy").lower(),
+        entry=float(t.entry or 0),
+        raw_pair=t.pair or "?",
+        leverage=int(t.leverage) if t.leverage else None,
+        take_profit=float(t.take_profit) if t.take_profit is not None else None,
+        stop_loss=float(t.stop_loss) if t.stop_loss is not None else None,
+    )
+
+
+def _sl_breached(*, side: str, mark: float, stop_loss: float) -> bool:
+    if side == "buy":
+        return mark <= stop_loss
+    return mark >= stop_loss
+
+
+def _with_default_window(signal: Signal, hours: float) -> Signal:
+    """Cryptocium (and any signal without a window) rests for `hours`, then cancels."""
+    if signal.window_end is not None or signal.valid_until is not None:
+        return signal
+    if hours <= 0:
+        return signal
+    now = datetime.now(timezone.utc)
+    return replace(
+        signal,
+        window_start=signal.window_start or now,
+        window_end=now + timedelta(hours=hours),
+    )
+
+
+async def _exposure_symbols(trader: Trader, store) -> set[str]:
+    """Symbols that already occupy a slot: a live position or a resting entry."""
+    syms: set[str] = set()
+    if hasattr(trader, "fetch_open_positions"):
+        try:
+            positions = await _run_sync(trader.fetch_open_positions)
+        except Exception:
+            logger.exception("exposure: fetch_open_positions failed")
+            positions = []
+        for p in positions or []:
+            syms.add(_norm_trade_sym(p.get("symbol")))
+    if not hasattr(store, "list_open_trades"):
+        return {s for s in syms if s}
+    try:
+        opens = await _run_sync(store.list_open_trades, source="live", limit=50)
+    except Exception:
+        logger.exception("exposure: list_open_trades failed")
+        return {s for s in syms if s}
+    for t in opens:
+        key = _norm_trade_sym(t.symbol or t.pair)
+        if not key or key in syms or not t.order_id or not hasattr(trader, "fetch_order"):
+            continue
+        try:
+            order = await _run_sync(trader.fetch_order, str(t.order_id), t.symbol or t.pair)
+        except Exception:
+            continue
+        if _entry_still_working(order):
+            syms.add(key)
+    return {s for s in syms if s}
+
+
+async def _risk_block_reason(store, trader: Trader, signal: Signal, cfg: dict) -> str | None:
+    """Return a user-facing skip reason, or None when a new entry is allowed."""
+    limit_r = float(cfg.get("DAILY_LOSS_R", "5"))
+    max_open = int(cfg.get("MAX_OPEN_POSITIONS", "6"))
+    if hasattr(store, "realized_r_between") and limit_r > 0:
+        start, end = day_bounds_wib()
+        start = clamp_to_baseline(start, await _run_sync(_baseline_ts, store))
+        try:
+            realized = float(await _run_sync(store.realized_r_between, start, end))
+        except Exception:
+            logger.exception("daily R lookup failed")
+            realized = 0.0
+        if daily_loss_hit(realized, limit_r):
+            return f"Stop harian {realized:.2f}R (batas -{limit_r:g}R). Lanjut besok."
+    try:
+        syms = await _exposure_symbols(trader, store)
+    except Exception:
+        logger.exception("exposure lookup failed")
+        syms = set()
+    key = _norm_trade_sym(signal.swap_symbol)
+    if key and key in syms:
+        return f"Sudah ada posisi atau limit {signal.pair}."
+    if max_open > 0 and len(syms) >= max_open:
+        return f"Sudah {len(syms)} posisi/limit terbuka (maks {max_open})."
+    return None
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+async def _cancel_stale_resting_entries(
+    *,
+    client: TelegramClient,
+    store,
+    owner_id: int,
+    cfg: dict,
+    rt_path,
+    notif_chat: int,
+) -> None:
+    """Cancel unfilled entries whose window (or 1-day default) has already ended."""
+    if not hasattr(store, "list_open_trades"):
+        return
+    traders = await _run_sync(
+        _resolve_order_traders, store, owner_id, cfg, rt_path=rt_path
+    )
+    hours = float(cfg.get("NO_WINDOW_HOURS", "24"))
+    now = datetime.now(timezone.utc)
+    try:
+        opens = await _run_sync(store.list_open_trades, source="live", limit=50)
+    except Exception:
+        logger.exception("stale sweep: list_open_trades failed")
+        return
+    for ex_name, trader in traders:
+        if not hasattr(trader, "fetch_order"):
+            continue
+        pos_syms: set[str] = set()
+        if hasattr(trader, "fetch_open_positions"):
+            try:
+                positions = await _run_sync(trader.fetch_open_positions)
+            except Exception:
+                logger.exception("stale sweep: positions failed")
+                positions = []
+            pos_syms = {_norm_trade_sym(p.get("symbol")) for p in positions or []}
+        for t in opens:
+            ex = (getattr(t, "exchange", None) or "").lower()
+            if ex and ex != ex_name:
+                continue
+            key = _norm_trade_sym(t.symbol or t.pair)
+            if key in pos_syms or not t.order_id:
+                continue
+            end = _parse_dt(t.window_end)
+            opened = _parse_dt(t.opened_at)
+            stale = (end is not None and end <= now) or (
+                end is None
+                and opened is not None
+                and now - opened >= timedelta(hours=hours)
+            )
+            if not stale:
+                continue
+            try:
+                order = await _run_sync(
+                    trader.fetch_order, str(t.order_id), t.symbol or t.pair
+                )
+            except Exception:
+                logger.exception("stale sweep: fetch %s failed", t.order_id)
+                continue
+            if not _entry_still_working(order):
+                continue
+            try:
+                await _run_sync(trader.cancel_order, str(t.order_id), t.symbol or t.pair)
+            except Exception as e:
+                logger.exception("stale sweep: cancel %s failed", t.order_id)
+                try:
+                    await client.send_message(
+                        notif_chat,
+                        _dm_cancel_failed(
+                            pair=t.pair,
+                            order_id=str(t.order_id),
+                            error=f"{type(e).__name__}: {e}",
+                        ),
+                    )
+                except Exception:
+                    pass
+                continue
+            if hasattr(store, "close_trade_by_order_id"):
+                try:
+                    await _run_sync(
+                        store.close_trade_by_order_id,
+                        str(t.order_id),
+                        status="canceled",
+                        exit_reason="window_end",
+                    )
+                except Exception:
+                    logger.exception("stale sweep: db close %s failed", t.order_id)
+            logger.info("Canceled stale resting entry %s %s", t.pair, t.order_id)
+            try:
+                await client.send_message(
+                    notif_chat, _dm_canceled(t.pair, "Window ended")
+                )
+            except Exception:
+                pass
+
+
+async def _watch_fill_and_attach_protective(
+    *,
+    client: TelegramClient,
+    trader: Trader,
+    notif_chat: int,
+    order_id: str,
+    symbol: str,
+    signal: Signal,
+    store=None,
+    invalid_r: float = 0.3,
+    poll_s: float = 15.0,
+) -> None:
+    """Poll entry until fill, then attach Binance TP/SL (or emergency close)."""
+    if not hasattr(trader, "attach_protective_orders"):
+        return
+    if signal.take_profit is None and signal.stop_loss is None:
+        return
+    end = signal.window_end or signal.valid_until
+    end_utc = None
+    if end is not None:
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+
+    logger.info("Watching fill for protective TP/SL on %s order %s", symbol, order_id)
+    covered = 0.0
+    while True:
+        window_done = bool(end_utc and datetime.now(timezone.utc) >= end_utc)
+        try:
+            order = await _run_sync(trader.fetch_order, order_id, symbol)
+        except Exception:
+            logger.exception("Protective watch fetch_order failed for %s", order_id)
+            if window_done:
+                logger.info("Protective watch stopped — window ended for %s", order_id)
+                return
+            await asyncio.sleep(poll_s)
+            continue
+
+        status = (order.get("status") or "").lower()
+        filled = 0.0
+        try:
+            filled = float(order.get("filled") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if filled <= 0 and status in ("closed", "filled"):
+            try:
+                filled = float(order.get("amount") or 0)
+            except (TypeError, ValueError):
+                filled = 0.0
+
+        if filled > covered + 1e-9:
+            note = await _run_sync(
+                trader.attach_protective_orders, signal, symbol=symbol, amount=filled
+            )
+            covered = filled
+            logger.info("Protective after fill %s: %s", order_id, note)
+            try:
+                await client.send_message(notif_chat, _dm_filled(signal.pair, note or ""))
+            except Exception:
+                pass
+
+        if window_done:
+            logger.info("Protective watch stopped — window ended for %s", order_id)
+            return
+
+        if status in ("canceled", "cancelled", "expired", "rejected", "closed", "filled"):
+            if filled <= covered + 1e-9:
+                logger.info("Protective watch: entry %s is %s — stop", order_id, status)
+                return
+
+        if (
+            filled <= 0
+            and invalid_r > 0
+            and hasattr(trader, "exchange")
+            and prefill_invalidated(
+                side=signal.side,
+                entry=signal.entry,
+                stop_loss=signal.stop_loss,
+                mark=await _run_sync(_fetch_mark_price, trader.exchange, symbol),
+                fraction=invalid_r,
+            )
+        ):
+            logger.info(
+                "Prefill invalid: %s mark moved %.2fR toward SL — cancel %s",
+                symbol,
+                invalid_r,
+                order_id,
+            )
+            try:
+                await _run_sync(trader.cancel_order, order_id, symbol)
+            except Exception as e:
+                logger.exception("Prefill cancel failed for %s", order_id)
+                try:
+                    await client.send_message(
+                        notif_chat,
+                        _dm_cancel_failed(
+                            pair=signal.pair,
+                            order_id=order_id,
+                            error=f"{type(e).__name__}: {e}",
+                        ),
+                    )
+                except Exception:
+                    pass
+                return
+            if store is not None and hasattr(store, "close_trade_by_order_id"):
+                try:
+                    await _run_sync(
+                        store.close_trade_by_order_id,
+                        order_id,
+                        status="canceled",
+                        exit_reason="prefill_invalid",
+                    )
+                except Exception:
+                    logger.exception("Prefill DB close failed for %s", order_id)
+            try:
+                await client.send_message(
+                    notif_chat,
+                    _dm_canceled(
+                        signal.pair,
+                        f"Price moved {invalid_r:g}R toward SL before fill",
+                    ),
+                )
+            except Exception:
+                pass
+            return
+
+        await asyncio.sleep(poll_s)
+
+
+async def _maybe_close_flat_trade(
+    *,
+    store,
+    trade,
+    exit_price: float,
+    exit_reason: str,
+    status: str | None = None,
+) -> tuple[float, float, str]:
+    """Compute pnl/R and close DB trade. Returns (pnl, r, status)."""
+    side = (trade.side or "buy").lower()
+    entry = float(trade.entry or 0)
+    amount = float(trade.amount or 0)
+    sl = float(trade.stop_loss) if trade.stop_loss is not None else None
+    tp = float(trade.take_profit) if trade.take_profit is not None else None
+    pnl, r = close_metrics(
+        side=side, entry=entry, exit_price=exit_price, amount=amount, stop_loss=sl
+    )
+    st = status or infer_exit_status(
+        side=side, entry=entry, exit_price=exit_price, stop_loss=sl, take_profit=tp
+    )
+    if hasattr(store, "close_trade"):
+        await _run_sync(
+            store.close_trade,
+            trade.id,
+            status=st,
+            exit_price=float(exit_price),
+            exit_reason=exit_reason,
+            pnl=float(pnl),
+            r_multiple=float(r),
+        )
+    return pnl, r, st
+
+
+def _baseline_ts(store) -> datetime | None:
+    if not hasattr(store, "latest_equity_baseline"):
+        return None
+    try:
+        row = store.latest_equity_baseline(source="live")
+    except Exception:
+        logger.exception("baseline lookup failed")
+        return None
+    if not row:
+        return None
+    return row[0]
+
+
+async def _today_realized(store) -> float | None:
+    if not hasattr(store, "realized_r_between"):
+        return None
+    start, end = day_bounds_wib()
+    start = clamp_to_baseline(start, await _run_sync(_baseline_ts, store))
+    try:
+        return float(await _run_sync(store.realized_r_between, start, end))
+    except Exception:
+        logger.exception("today R for notify failed")
+        return None
+
+
+async def _dm_trade_closed(
+    client: TelegramClient,
+    notif_chat: int,
+    store,
+    cfg: dict,
+    *,
+    pair: str,
+    status: str,
+    r_multiple: float | None,
+    pnl: float | None,
+) -> None:
+    try:
+        today_r = await _today_realized(store)
+        limit_r = float(cfg.get("DAILY_LOSS_R", "5"))
+        await client.send_message(
+            notif_chat,
+            _dm_closed(
+                pair=pair,
+                status=status,
+                r_multiple=r_multiple,
+                pnl=pnl,
+                today_r=today_r,
+                limit_r=limit_r,
+            ),
+        )
+    except Exception:
+        pass
+
+
+async def _entry_still_pending(trader, trade) -> bool:
+    """True if entry order exists and has not filled yet (skip flat-close)."""
+    order_id = getattr(trade, "order_id", None)
+    symbol = getattr(trade, "symbol", None) or getattr(trade, "pair", None)
+    if not order_id or not symbol or not hasattr(trader, "fetch_order"):
+        return False
+    try:
+        order = await _run_sync(trader.fetch_order, str(order_id), symbol)
+    except Exception:
+        return False
+    status = (order.get("status") or "").lower()
+    try:
+        filled = float(order.get("filled") or 0)
+    except (TypeError, ValueError):
+        filled = 0.0
+    if filled > 0:
+        return False
+    if status in ("canceled", "cancelled", "expired", "rejected", "closed", "filled"):
+        return False
+    return True
+
+
+async def _reconcile_binance_stops(
+    *,
+    client: TelegramClient,
+    store,
+    owner_id: int,
+    cfg: dict,
+    rt_path,
+    notif_chat: int,
+    attached: set[str],
+    fail_counts: dict[int, int],
+    orphan_alerted: set[str],
+    close_fail_escalate: int = 3,
+) -> None:
+    """Close positions past SL; sync flat exits; attach missing TP/SL; orphan alerts."""
+    traders = await _run_sync(
+        _resolve_order_traders, store, owner_id, cfg, rt_path=rt_path
+    )
+    binance_traders = [
+        (name, t) for name, t in traders if name == "binance" and hasattr(t, "attach_protective_orders")
+    ]
+    if not binance_traders or not hasattr(store, "list_open_trades"):
+        return
+
+    opens = await _run_sync(store.list_open_trades, source="live", limit=100)
+    if not opens and not binance_traders:
+        return
+
+    for ex_name, trader in binance_traders:
+        try:
+            positions = await _run_sync(trader.fetch_open_positions)
+        except Exception:
+            logger.exception("reconcile: fetch_open_positions failed")
+            continue
+        by_sym = {_norm_trade_sym(p.get("symbol")): p for p in positions}
+        matched_syms: set[str] = set()
+
+        for t in opens:
+            ex = (getattr(t, "exchange", None) or "").lower()
+            if ex and ex != "binance":
+                continue
+            key = _norm_trade_sym(t.symbol or t.pair)
+            pos = by_sym.get(key)
+            sig = _signal_from_trade(t)
+            attach_key = f"{ex_name}:{t.id}"
+            sym_key = f"{ex_name}:sym:{key}"
+
+            # --- Exchange flat while DB still open → close with real pnl/R ---
+            if is_position_flat(pos):
+                if await _entry_still_pending(trader, t):
+                    continue
+                exit_px = float(t.entry or 0)
+                # Best-effort last price for better tp/sl inference.
+                try:
+                    if hasattr(trader, "exchange") and t.symbol:
+                        ticker = await _run_sync(trader.exchange.fetch_ticker, t.symbol)
+                        last = ticker.get("last") or ticker.get("close")
+                        if last is not None:
+                            exit_px = float(last)
+                except Exception:
+                    if sig.stop_loss is not None and sig.take_profit is None:
+                        exit_px = float(sig.stop_loss)
+                    elif sig.take_profit is not None and sig.stop_loss is None:
+                        exit_px = float(sig.take_profit)
+                try:
+                    pnl, r, st = await _maybe_close_flat_trade(
+                        store=store,
+                        trade=t,
+                        exit_price=exit_px,
+                        exit_reason="exchange_flat",
+                    )
+                except Exception:
+                    logger.exception("exchange_flat close failed for #%s", t.id)
+                    continue
+                fail_counts.pop(t.id, None)
+                await _dm_trade_closed(
+                    client,
+                    notif_chat,
+                    store,
+                    cfg,
+                    pair=t.pair,
+                    status=st,
+                    r_multiple=r,
+                    pnl=pnl,
+                )
+                continue
+
+            matched_syms.add(key)
+            mark = pos.get("mark")
+            amount = position_contracts(pos) or float(t.amount or 0)
+            if amount <= 0 or mark is None:
+                continue
+
+            if sig.stop_loss is not None and _sl_breached(
+                side=sig.side, mark=float(mark), stop_loss=float(sig.stop_loss)
+            ):
+                note = await _run_sync(
+                    trader.attach_protective_orders,
+                    sig,
+                    symbol=pos.get("symbol") or t.symbol,
+                    amount=amount,
+                )
+                attached.add(attach_key)
+                attached.add(sym_key)
+
+                # Re-verify exchange is flat before touching DB.
+                try:
+                    positions2 = await _run_sync(trader.fetch_open_positions)
+                except Exception:
+                    logger.exception("reconcile re-fetch positions failed")
+                    positions2 = positions
+                by_sym2 = {_norm_trade_sym(p.get("symbol")): p for p in positions2}
+                pos2 = by_sym2.get(key)
+                if not is_position_flat(pos2):
+                    n = fail_counts.get(t.id, 0) + 1
+                    fail_counts[t.id] = n
+                    msg = _dm_sl_open(
+                        trade_id=t.id,
+                        pair=t.pair,
+                        side=(t.side or "").upper(),
+                        mark=float(mark) if mark is not None else None,
+                        stop_loss=sig.stop_loss,
+                        attempt=n,
+                        limit=close_fail_escalate,
+                        note=note or "",
+                    )
+                    if n >= close_fail_escalate:
+                        msg += "\nManual intervene — close failed repeatedly."
+                    try:
+                        await client.send_message(notif_chat, msg)
+                    except Exception:
+                        pass
+                    continue
+
+                exit_px = float(mark)
+                try:
+                    pnl, r, st = await _maybe_close_flat_trade(
+                        store=store,
+                        trade=t,
+                        exit_price=exit_px,
+                        exit_reason="reconcile_sl_breach",
+                        status="sl",
+                    )
+                except Exception:
+                    logger.exception("close_trade failed for #%s", t.id)
+                    continue
+                fail_counts.pop(t.id, None)
+                await _dm_trade_closed(
+                    client,
+                    notif_chat,
+                    store,
+                    cfg,
+                    pair=t.pair,
+                    status=st,
+                    r_multiple=r,
+                    pnl=pnl,
+                )
+                continue
+
+            if sig.stop_loss is None and sig.take_profit is None:
+                continue
+            note = await _run_sync(
+                trader.attach_protective_orders,
+                sig,
+                symbol=pos.get("symbol") or t.symbol,
+                amount=amount,
+            )
+            note_l = (note or "").lower()
+            # If protective path market-closed, sync DB.
+            if "closed market" in note_l or "sl→market" in note_l:
+                try:
+                    positions2 = await _run_sync(trader.fetch_open_positions)
+                    by_sym2 = {_norm_trade_sym(p.get("symbol")): p for p in positions2}
+                    if is_position_flat(by_sym2.get(key)):
+                        close_status = (
+                            "tp" if "tp already through" in note_l else "sl"
+                        )
+                        pnl, r, st = await _maybe_close_flat_trade(
+                            store=store,
+                            trade=t,
+                            exit_price=float(mark),
+                            exit_reason="protective_market_close",
+                            status=close_status,
+                        )
+                        fail_counts.pop(t.id, None)
+                        await _dm_trade_closed(
+                            client,
+                            notif_chat,
+                            store,
+                            cfg,
+                            pair=t.pair,
+                            status=st,
+                            r_multiple=r,
+                            pnl=pnl,
+                        )
+                        continue
+                except Exception:
+                    logger.exception("post-protective flat sync failed #%s", t.id)
+
+            if "already open" in note_l and "skip" in note_l:
+                continue
+            if "coverage unknown" in note_l:
+                logger.warning("Reconcile protective #%s: %s", t.id, note)
+                continue
+            if "already open" in note_l or (
+                "placed" in note_l and "not placed" not in note_l
+            ):
+                attached.add(attach_key)
+                attached.add(sym_key)
+            elif "closed" in note_l:
+                attached.add(attach_key)
+                attached.add(sym_key)
+            else:
+                logger.warning("Reconcile protective #%s: %s", t.id, note)
+                continue
+            logger.info("Reconcile protective #%s: %s", t.id, note)
+
+        # --- Orphan: exchange position with no matching DB open ---
+        db_keys = {
+            _norm_trade_sym(t.symbol or t.pair)
+            for t in opens
+            if not (getattr(t, "exchange", None) or "")
+            or (getattr(t, "exchange", None) or "").lower() == "binance"
+        }
+        for p in positions:
+            key = _norm_trade_sym(p.get("symbol"))
+            if not key or key in matched_syms or key in db_keys:
+                continue
+            alert_key = f"{ex_name}:orphan:{key}"
+            if alert_key in orphan_alerted:
+                continue
+            orphan_alerted.add(alert_key)
+            try:
+                await client.send_message(
+                    notif_chat,
+                    _dm_orphan(
+                        symbol=str(p.get("symbol") or "?"),
+                        side=str(p.get("side") or "?"),
+                        contracts=p.get("contracts"),
+                        entry=p.get("entry"),
+                        mark=p.get("mark"),
+                        unrealized=p.get("unrealized_pnl"),
+                    ),
+                )
+            except Exception:
+                pass
+
+
+async def _sl_guard_loop(
+    *,
+    client: TelegramClient,
+    store,
+    owner_id: int,
+    cfg: dict,
+    rt_path,
+    notif_chat: int,
+    interval_s: float = 60.0,
+) -> None:
+    attached: set[str] = set()
+    fail_counts: dict[int, int] = {}
+    orphan_alerted: set[str] = set()
+    await asyncio.sleep(20)  # let startup settle
+    while True:
+        try:
+            await _reconcile_binance_stops(
+                client=client,
+                store=store,
+                owner_id=owner_id,
+                cfg=cfg,
+                rt_path=rt_path,
+                notif_chat=notif_chat,
+                attached=attached,
+                fail_counts=fail_counts,
+                orphan_alerted=orphan_alerted,
+            )
+        except Exception:
+            logger.exception("SL guard loop error")
+        await asyncio.sleep(interval_s)
 
 
 async def _cmd_status(
@@ -212,7 +951,7 @@ async def _cmd_status(
     m, s = divmod(rem, 60)
     store_name = type(store).__name__
     if trader.equity_pct > 0:
-        size_line = f"Size: {trader.equity_pct}% of USDT equity\n"
+        size_line = f"Size: {trader.equity_pct}% equity as 1R risk at SL\n"
     else:
         size_line = f"Size: fixed {trader.amount} (base coin)\n"
     await event.reply(
@@ -230,11 +969,11 @@ async def _cmd_status(
     )
 
 
-def _load_user_trader(store, telegram_id: int, cfg: dict) -> Trader | None:
-    """Load and decrypt per-user credentials from DB, return a Trader or None."""
-    if cfg.get("PREFER_DB_CREDENTIALS", "true").lower() not in ("1", "true", "yes"):
-        return None
-    exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
+def _load_trader_for_exchange(
+    store, telegram_id: int, cfg: dict, exchange: str
+) -> Trader | None:
+    """Load trader for one exchange (DB credentials or env for that venue)."""
+    exchange = exchange.lower().strip()
     dry_run = cfg.get("TRADE_DRY_RUN", "true").lower() in ("1", "true", "yes")
     common = {
         "margin_mode": cfg.get("TRADE_MARGIN_MODE", "cross"),
@@ -246,43 +985,74 @@ def _load_user_trader(store, telegram_id: int, cfg: dict) -> Trader | None:
         "position_mode": cfg.get("TRADE_POSITION_MODE", "net"),
         "dry_run": dry_run,
     }
-    if not hasattr(store, "load_credentials"):
-        return None
+    prefer_db = cfg.get("PREFER_DB_CREDENTIALS", "true").lower() in ("1", "true", "yes")
+    if prefer_db and hasattr(store, "load_credentials"):
+        try:
+            row = store.load_credentials(telegram_id, exchange)
+        except Exception as e:
+            logger.warning(
+                "load_credentials failed for %s user %s (%s)",
+                exchange,
+                telegram_id,
+                e,
+            )
+            row = None
+        if row:
+            try:
+                api_key = decrypt(row["api_key_enc"])
+                secret = decrypt(row["secret_enc"])
+                extra = decrypt(row["extra_enc"]) if row.get("extra_enc") else ""
+            except Exception:
+                logger.exception("Failed to decrypt credentials for %s", exchange)
+                return None
+            if exchange == "bybit":
+                return BybitTrader(
+                    api_key=api_key,
+                    secret=secret,
+                    sandbox=row.get("sandbox", False),
+                    demo=row.get("demo", False),
+                    **common,
+                )
+            if exchange == "binance":
+                return BinanceTrader(
+                    api_key=api_key,
+                    secret=secret,
+                    sandbox=row.get("sandbox", False),
+                    demo=row.get("demo", False),
+                    **common,
+                )
+            return OkxTrader(
+                api_key=api_key,
+                secret=secret,
+                password=extra,
+                sandbox=row.get("sandbox", False),
+                **common,
+            )
     try:
-        row = store.load_credentials(telegram_id, exchange)
-    except Exception as e:
-        # Table missing / RLS / network — fall back to env trader
-        logger.warning(
-            "load_credentials failed for user %s (%s); using env trader",
-            telegram_id,
-            e,
-        )
-        return None
-    if not row:
-        return None
-    try:
-        api_key = decrypt(row["api_key_enc"])
-        secret = decrypt(row["secret_enc"])
-        extra = decrypt(row["extra_enc"]) if row.get("extra_enc") else ""
-    except Exception:
-        logger.exception("Failed to decrypt credentials for user %s", telegram_id)
+        return make_trader_for_exchange(cfg, exchange)
+    except ValueError:
         return None
 
-    if exchange == "bybit":
-        return BybitTrader(
-            api_key=api_key,
-            secret=secret,
-            sandbox=row.get("sandbox", False),
-            demo=row.get("demo", False),
-            **common,
-        )
-    return OkxTrader(
-        api_key=api_key,
-        secret=secret,
-        password=extra,
-        sandbox=row.get("sandbox", False),
-        **common,
-    )
+
+def _load_user_trader(store, telegram_id: int, cfg: dict) -> Trader | None:
+    """Legacy: trader for EXCHANGE env only."""
+    exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
+    return _load_trader_for_exchange(store, telegram_id, cfg, exchange)
+
+
+def _resolve_order_traders(
+    store, telegram_id: int, cfg: dict, *, rt_path: Path
+) -> list[tuple[str, Trader]]:
+    """All enabled exchanges that have a usable trader."""
+    enabled = enabled_exchange_names(rt_path, cfg=cfg)
+    out: list[tuple[str, Trader]] = []
+    for ex in enabled:
+        t = _load_trader_for_exchange(store, telegram_id, cfg, ex)
+        if t is None:
+            logger.warning("Exchange %s enabled but no credentials/env keys", ex)
+            continue
+        out.append((ex, t))
+    return out
 
 
 def _register_bot_commands(
@@ -298,6 +1068,7 @@ def _register_bot_commands(
     session_started: float,
     exchange: str,
     cfg: dict,
+    watch_channels=None,
 ) -> None:
     @bot_client.on(events.NewMessage(pattern=r"^/status(@\w+)?$"))
     async def on_bot_command(event: events.NewMessage.Event) -> None:
@@ -347,13 +1118,15 @@ def _register_bot_commands(
                 "Lebih mudah: /settings → 🔑 Set API Key\n\n"
                 "OKX: `/setkey okx API_KEY SECRET PASSWORD`\n"
                 "Bybit: `/setkey bybit API_KEY SECRET`\n"
-                "Bybit demo: `/setkey bybit API_KEY SECRET --demo`",
+                "Bybit demo: `/setkey bybit API_KEY SECRET --demo`\n"
+                "Binance: `/setkey binance API_KEY SECRET`\n"
+                "Binance demo: `/setkey binance API_KEY SECRET --demo`",
             )
             return
 
         exch = parts[1].lower()
-        if exch not in ("okx", "bybit"):
-            await event.respond("❌ Exchange harus `okx` atau `bybit`.")
+        if exch not in ("okx", "bybit", "binance"):
+            await event.respond("❌ Exchange harus `okx`, `bybit`, atau `binance`.")
             return
 
         api_key_plain = parts[2]
@@ -367,7 +1140,7 @@ def _register_bot_commands(
                 await event.respond("❌ OKX butuh PASSWORD (passphrase). `/setkey okx KEY SECRET PASSWORD`")
                 return
             extra_plain = parts[4]
-        elif exch == "bybit":
+        elif exch in ("bybit", "binance"):
             flags = [p.lower() for p in parts[4:]]
             if "--demo" in flags:
                 is_demo = True
@@ -417,11 +1190,11 @@ def _register_bot_commands(
             return
         parts = event.raw_text.strip().split()
         if len(parts) < 2:
-            await event.respond("❌ Format: `/delkey okx` atau `/delkey bybit`")
+            await event.respond("❌ Format: `/delkey okx` atau `/delkey bybit` atau `/delkey binance`")
             return
         exch = parts[1].lower()
-        if exch not in ("okx", "bybit"):
-            await event.respond("❌ Exchange harus `okx` atau `bybit`.")
+        if exch not in ("okx", "bybit", "binance"):
+            await event.respond("❌ Exchange harus `okx`, `bybit`, atau `binance`.")
             return
         if not hasattr(store, "delete_credentials"):
             await event.respond("❌ Store tidak support hapus credentials.")
@@ -457,19 +1230,6 @@ def _register_bot_commands(
             lines.append(f"• {exch} — {mode}")
         await event.respond("\n".join(lines))
 
-    register_settings_menu(
-        bot_client,
-        owner_id=owner_id,
-        channel=channel,
-        signal_chat=signal_chat,
-        dry_run=dry_run,
-        sandbox=sandbox,
-        store=store,
-        trader=trader,
-        session_started=session_started,
-        exchange=exchange,
-        cfg=cfg,
-    )
 
 async def _run_session(cfg: dict, secrets: dict) -> None:
     """One Telethon connection lifecycle — never reuse client across loops."""
@@ -502,9 +1262,15 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
 
     dry_run = cfg.get("TRADE_DRY_RUN", "true").lower() in ("1", "true", "yes")
     exchange = (cfg.get("EXCHANGE") or "okx").lower().strip()
+    rt_path = runtime_path(DATA)
+    load_enabled(rt_path, cfg=cfg)
     missing = required_credentials(cfg, dry_run=dry_run)
-    if missing:
-        raise SystemExit(f"Missing env for live trading on {exchange}: {', '.join(missing)}")
+    if missing and not dry_run:
+        logger.warning(
+            "Env missing for legacy EXCHANGE=%s: %s — per-venue keys / DB may still work",
+            exchange,
+            ", ".join(missing),
+        )
 
     trader = make_trader(cfg)
     sandbox = trader.sandbox
@@ -554,6 +1320,25 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             logger.info("Using bot session — bot must be member of signal group")
             bot_client = client
 
+        register_settings_menu(
+            bot_client,
+            owner_id=owner_id,
+            channel=channel,
+            signal_chat=signal_chat,
+            dry_run=dry_run,
+            sandbox=sandbox,
+            store=store,
+            trader=trader,
+            session_started=session_started,
+            exchange=exchange,
+            cfg=cfg,
+            watch_channels=watch_channels,
+            rt_path=rt_path,
+            resolve_traders=lambda: _resolve_order_traders(
+                store, owner_id, cfg, rt_path=rt_path
+            ),
+        )
+
         _register_bot_commands(
             bot_client,
             owner_id=owner_id,
@@ -566,17 +1351,37 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             session_started=session_started,
             exchange=exchange,
             cfg=cfg,
+            watch_channels=watch_channels,
         )
 
         me = await client.get_me()
         logger.info(
-            "Logged in as %s | exchange=%s | dry_run=%s | sandbox=%s | parse_only=%s | watch=%s",
+            "Logged in as %s | dry_run=%s | enabled=%s | watch=%s",
             me.id,
-            exchange,
             dry_run,
-            sandbox,
-            cfg.get("SIGNAL_PARSE_ONLY", "false"),
+            enabled_exchange_names(rt_path, cfg=cfg),
             watch_chats,
+        )
+        notify_client = bot_client if bot_client is not None else client
+        await _cancel_stale_resting_entries(
+            client=notify_client,
+            store=store,
+            owner_id=owner_id,
+            cfg=cfg,
+            rt_path=rt_path,
+            notif_chat=notif_chat,
+        )
+        _track(
+            asyncio.create_task(
+                _sl_guard_loop(
+                    client=notify_client,
+                    store=store,
+                    owner_id=owner_id,
+                    cfg=cfg,
+                    rt_path=rt_path,
+                    notif_chat=notif_chat,
+                )
+            )
         )
         notify_client = bot_client if bot_client is not None else client
 
@@ -592,6 +1397,16 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             topic = _message_topic_id(event.message)
             src = match_channel(watch_channels, src_chat, topic)
             if src is None:
+                for c in watch_channels:
+                    if c.chat_id == src_chat and c.topic_id is not None:
+                        logger.debug(
+                            "Ignore msg %s chat=%s topic=%s (want topic=%s for %s)",
+                            event.id,
+                            src_chat,
+                            topic,
+                            c.topic_id,
+                            c.key,
+                        )
                 return
             text = event.raw_text or ""
             if src.parser == "cryptocium" and "SETUP" not in text.upper():
@@ -618,6 +1433,9 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     )
                 return
 
+            signal = _with_default_window(
+                signal, float(cfg.get("NO_WINDOW_HOURS", "24"))
+            )
             logger.info(
                 "Signal: %s %s @ %s lev=%sx TP=%s SL=%s window=%s→%s → %s",
                 signal.side,
@@ -665,6 +1483,7 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
             if signal.is_expired:
                 msg = (
                     f"⏭ Signal expired, skip\n"
+                    f"Channel: {src.key}\n"
                     f"Pair: {signal.pair}\n"
                     f"Side: {signal.side}\n"
                     f"Entry: {signal.entry}\n"
@@ -683,69 +1502,114 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     )
                 return
 
-            # Allow test runs to force .env credentials by disabling DB preference.
-            active_trader = await _run_sync(_load_user_trader, store, owner_id, cfg) or trader
-            logger.info(
-                "Using trader: %s (per-user=%s)",
-                active_trader.exchange_name,
-                active_trader is not trader,
+            order_traders = await _run_sync(
+                _resolve_order_traders, store, owner_id, cfg, rt_path=rt_path
             )
+            if not order_traders:
+                await _dm(
+                    "⏸ Tidak ada venue aktif / key kosong.\n"
+                    f"{format_enabled_line(rt_path, cfg=cfg)}\n"
+                    "Buka /settings → Venue ON/OFF"
+                )
+                return
 
-            order_id = None
-            trade_id = None
-            try:
-                order = await _run_sync(active_trader.place_order, signal)
-                order_id = order.get("id") or order.get("info", {}).get("ordId")
+            order_kwargs = {"order_type": "limit"} if src.parser == "cryptocium" else {}
+            result_lines: list[str] = []
+            trade_ids: list[int] = []
+            cancel_jobs: list[tuple[Trader, str]] = []
+            protective_jobs: list[tuple[Trader, str]] = []
+
+            for ex_name, active_trader in order_traders:
+                reason = await _risk_block_reason(store, active_trader, signal, cfg)
+                if reason:
+                    logger.info("Skip %s on %s: %s", signal.pair, ex_name, reason)
+                    result_lines.append(skip_outcome(signal.pair, reason))
+                    continue
+                logger.info("Placing order on %s", ex_name)
                 try:
-                    trade_id = await _run_sync(
-                        store.add_trade,
-                        source="live",
-                        channel_key=src.key,
-                        pair=signal.pair,
-                        symbol=signal.swap_symbol,
-                        side=signal.side,
-                        entry=signal.entry,
-                        leverage=signal.leverage,
-                        take_profit=signal.take_profit,
-                        stop_loss=signal.stop_loss,
-                        amount=order.get("amount", trader.amount),
-                        status="open",
-                        order_id=str(order_id) if order_id else None,
-                        window_start=signal.window_start,
-                        window_end=signal.window_end or signal.valid_until,
-                        timeframe_raw=signal.timeframe_raw,
+                    order = await _run_sync(
+                        active_trader.place_order, signal, **order_kwargs
                     )
+                    order_id = order.get("id") or (order.get("info") or {}).get("ordId")
+                    trade_id = None
+                    try:
+                        trade_id = await _run_sync(
+                            store.add_trade,
+                            source="live",
+                            channel_key=src.key,
+                            exchange=ex_name,
+                            pair=signal.pair,
+                            symbol=signal.swap_symbol,
+                            side=signal.side,
+                            entry=signal.entry,
+                            leverage=signal.leverage,
+                            take_profit=signal.take_profit,
+                            stop_loss=signal.stop_loss,
+                            amount=order.get("amount", active_trader.amount),
+                            status="open",
+                            order_id=str(order_id) if order_id else None,
+                            window_start=signal.window_start,
+                            window_end=signal.window_end or signal.valid_until,
+                            timeframe_raw=signal.timeframe_raw,
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist trade for %s", ex_name)
+                    if trade_id:
+                        trade_ids.append(trade_id)
+                    risk_usdt = None
+                    try:
+                        amt = float(order.get("amount") or 0)
+                    except (TypeError, ValueError):
+                        amt = 0.0
+                    if amt > 0 and signal.stop_loss is not None:
+                        risk_usdt = amt * abs(float(signal.entry) - float(signal.stop_loss))
+                    placed = placed_outcome(ex_name, risk_usdt)
+                    if dry_run:
+                        placed += " · dry-run"
+                    if order.get("protective_note"):
+                        placed += f"\n{order['protective_note']}"
+                    result_lines.append(placed)
+                    if order_id and (signal.window_end or signal.valid_until):
+                        cancel_jobs.append((active_trader, str(order_id)))
+                    if (
+                        order_id
+                        and not dry_run
+                        and hasattr(active_trader, "attach_protective_orders")
+                        and (
+                            signal.take_profit is not None
+                            or signal.stop_loss is not None
+                        )
+                    ):
+                        protective_jobs.append((active_trader, str(order_id)))
+                except Exception as e:
+                    logger.exception("Order failed on %s", ex_name)
+                    err = str(e)
+                    if "SSL" in err or "CERTIFICATE" in err or "NetworkError" in type(e).__name__:
+                        err = (
+                            f"Network/SSL ke {ex_name.upper()} gagal. "
+                            "Pakai VPN / WiFi lain / VPS."
+                        )
+                    result_lines.append(failed_outcome(ex_name, err))
+
+            slots = 0
+            max_slots = int(cfg.get("MAX_OPEN_POSITIONS", "6"))
+            if order_traders:
+                try:
+                    slots = len(await _exposure_symbols(order_traders[0][1], store))
                 except Exception:
-                    logger.exception("Failed to persist trade")
-                msg = (
-                    f"✅ Order {'(dry-run) ' if dry_run else ''}berhasil\n"
-                    f"Pair: {signal.pair} → {signal.swap_symbol}\n"
-                    f"Side: {signal.side}\n"
-                    f"Entry: {signal.entry}\n"
-                    f"Leverage: {signal.leverage or '-'}x\n"
-                    f"TP: {signal.take_profit or '-'}\n"
-                    f"SL: {signal.stop_loss or '-'}\n"
-                    f"Timeframe: {signal.timeframe_raw or '-'}\n"
-                    f"Amount: {order.get('amount', trader.amount)}\n"
-                    f"Order ID: {order_id}"
-                )
-                if signal.window_end or signal.valid_until:
-                    msg += "\n⏳ Auto-cancel saat window habis"
-            except Exception as e:
-                logger.exception("Order failed")
-                err = str(e)
-                if "SSL" in err or "CERTIFICATE" in err or "NetworkError" in type(e).__name__:
-                    err = (
-                        f"Network/SSL ke {exchange.upper()} gagal (sering karena Telkomsel Internet Baik). "
-                        "Pakai VPN / WiFi lain / VPS."
-                    )
-                msg = (
-                    f"❌ Order gagal\n"
-                    f"Pair: {signal.pair}\n"
-                    f"Side: {signal.side}\n"
-                    f"Entry: {signal.entry}\n"
-                    f"Error: {err}"
-                )
+                    logger.exception("slot count for notify failed")
+            msg = signal_notice(
+                channel=src.key,
+                pair=signal.pair,
+                side=signal.side,
+                entry=signal.entry,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                window_end=signal.window_end or signal.valid_until,
+                slots=slots,
+                max_slots=max_slots,
+                outcomes=result_lines,
+            )
 
             if hasattr(store, "add_signal_event"):
                 await _run_sync(
@@ -755,12 +1619,12 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     chat_id=src_chat,
                     message_id=event.id,
                     parsed=True,
-                    trade_id=trade_id,
+                    trade_id=trade_ids[0] if trade_ids else None,
                 )
 
             await _dm(msg)
 
-            if order_id and (signal.window_end or signal.valid_until):
+            for active_trader, order_id in cancel_jobs:
                 _track(
                     asyncio.create_task(
                         _cancel_when_window_ends(
@@ -768,12 +1632,28 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                             trader=active_trader,
                             store=store,
                             notif_chat=notif_chat,
-                            order_id=str(order_id),
+                            order_id=order_id,
                             symbol=signal.swap_symbol,
                             signal=signal,
                         )
                     )
                 )
+            for active_trader, order_id in protective_jobs:
+                _track(
+                    asyncio.create_task(
+                        _watch_fill_and_attach_protective(
+                            client=notify_client,
+                            trader=active_trader,
+                            notif_chat=notif_chat,
+                            order_id=order_id,
+                            symbol=signal.swap_symbol,
+                            signal=signal,
+                            store=store,
+                            invalid_r=float(cfg.get("PREFILL_INVALID_R", "0.3")),
+                        )
+                    )
+                )
+            return
 
         print(f"Listening for signals in {watch_chats} (Ctrl+C to stop)")
         if bot_client is not client:

@@ -45,6 +45,16 @@ def period_bounds(weeks: int = 1, *, now: datetime | None = None) -> tuple[datet
     return start, end
 
 
+def period_bounds_today_wib(*, now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Calendar day in Asia/Jakarta (WIB) → UTC [start, now]."""
+    from .formats.common import WIB
+
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(WIB)
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc), now
+
+
 def build_weekly_metrics(
     store: TradeStore,
     *,

@@ -116,6 +116,26 @@ Confirm both containers are healthy before relying on Actions.
 
 ## Day-to-day deploy
 
+### Manual (current default while Actions billing is locked)
+
+From Mac, after pushing to GitHub:
+
+```bash
+git push origin main
+./scripts/deploy_from_mac.sh
+```
+
+That SSHs to the VM and runs `scripts/vm_deploy.sh` (`git fetch/reset` + `docker compose up -d --build`). Secrets on the VM are not overwritten.
+
+Or SSH in yourself:
+
+```bash
+cd ~/tele-forwarder
+bash scripts/vm_deploy.sh
+```
+
+### GitHub Actions (when billing is unlocked)
+
 1. Develop on Mac, push to `main` (or merge a PR).
 2. GitHub Actions runs tests, then SSHs to the VM and runs `docker compose up -d --build`.
 3. Or: **Actions → Deploy → Run workflow** (`workflow_dispatch`).
