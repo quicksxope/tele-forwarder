@@ -30,7 +30,7 @@ from .exchange_runtime import (
     toggle_exchange,
 )
 from .metrics import _is_win, compute_metrics
-from .risk_limits import day_bounds_wib
+from .risk_limits import clamp_to_baseline, day_bounds_wib
 from .trader import BinanceTrader, BybitTrader, OkxTrader, _fetch_mark_price
 from .weekly_report import period_bounds, period_bounds_today_wib
 
@@ -814,10 +814,24 @@ def _load_book(store, traders: list[tuple[str, Any]]):
     return book
 
 
+def _baseline_at(store) -> datetime | None:
+    if not hasattr(store, "latest_equity_baseline"):
+        return None
+    try:
+        row = store.latest_equity_baseline(source="live")
+    except Exception:
+        logger.exception("baseline lookup failed")
+        return None
+    if not row:
+        return None
+    return row[0]
+
+
 def _account_r(store) -> float | None:
     if not hasattr(store, "realized_r_between"):
         return None
     start, end = day_bounds_wib()
+    start = clamp_to_baseline(start, _baseline_at(store))
     try:
         return float(store.realized_r_between(start, end))
     except Exception:
@@ -871,6 +885,9 @@ def _history_text(store, traders, wallet: WalletView, channel_key: str | None, n
             baseline = store.latest_equity_baseline(source="live")
         except Exception:
             logger.exception("baseline failed")
+    baseline_at = baseline[0] if baseline else None
+    today_start = clamp_to_baseline(today_start, baseline_at)
+    week_start = clamp_to_baseline(week_start, baseline_at)
     spans = (
         ("Today", today_start, today_end),
         ("7 days", week_start, now + timedelta(seconds=1)),
@@ -971,6 +988,7 @@ def register_settings_menu(
         traders = _traders_for_live()
         now = datetime.now(timezone.utc)
         start, end = day_bounds_wib(now)
+        start = clamp_to_baseline(start, _baseline_at(store))
         total_r, wins, losses, rows = _closed_stats(store, start, end, channel_key)
         realized = total_r if channel_key else _account_r(store)
         cash = None if channel_key else _cash_between(traders, start, end)

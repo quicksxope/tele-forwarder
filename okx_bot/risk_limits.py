@@ -19,6 +19,17 @@ def day_bounds_wib(now: datetime | None = None) -> tuple[datetime, datetime]:
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
+def clamp_to_baseline(start: datetime, baseline_at: datetime | None) -> datetime:
+    """Do not score trades from before the latest ROI reset."""
+    if baseline_at is None:
+        return start
+    if baseline_at.tzinfo is None:
+        baseline_at = baseline_at.replace(tzinfo=timezone.utc)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return max(start, baseline_at.astimezone(timezone.utc))
+
+
 def prefill_invalidated(
     *,
     side: str,

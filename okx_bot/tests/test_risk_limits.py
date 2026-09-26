@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 
 from okx_bot.risk_limits import (
+    clamp_to_baseline,
     daily_loss_hit,
     day_bounds_wib,
     prefill_invalidated,
@@ -15,6 +16,13 @@ def test_day_bounds_are_wib_midnight() -> None:
     start, end = day_bounds_wib(now)
     assert start.isoformat() == "2026-09-24T17:00:00+00:00"
     assert end.isoformat() == "2026-09-25T17:00:00+00:00"
+
+
+def test_clamp_today_to_reset() -> None:
+    midnight, _end = day_bounds_wib(datetime(2026, 9, 25, 8, 0, tzinfo=timezone.utc))
+    reset = datetime(2026, 9, 25, 7, 34, tzinfo=timezone.utc)
+    assert clamp_to_baseline(midnight, reset) == reset
+    assert clamp_to_baseline(reset, midnight) == reset
 
 
 def test_prefill_invalid_long_and_short() -> None:

@@ -186,6 +186,61 @@ def _binance_exit_trigger_valid(
     return trigger > mark
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes")
+    return bool(value)
+
+
+def _row_qty(row: dict[str, Any]) -> float:
+    for key in ("quantity", "origQty", "amount", "qty"):
+        raw = row.get(key)
+        if raw is None or str(raw) in ("", "None"):
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+class ProtectiveCoverage:
+    """Open stop and take-profit size already working on a symbol."""
+
+    def __init__(self) -> None:
+        self.has_sl = False
+        self.tp_qty = 0.0
+        self.tp_closes_all = False
+        self._seen: set[str] = set()
+
+    def add(
+        self,
+        typ: str,
+        qty: float,
+        *,
+        close_position: bool = False,
+        order_id: str | None = None,
+    ) -> None:
+        if order_id:
+            if order_id in self._seen:
+                return
+            self._seen.add(order_id)
+        kind = (typ or "").upper()
+        if "TAKE_PROFIT" in kind:
+            if close_position:
+                self.tp_closes_all = True
+            elif qty > 0:
+                self.tp_qty += qty
+            return
+        if "STOP" in kind or "TRAILING" in kind:
+            self.has_sl = True
+
+    def tp_covers(self, amount: float, dust: float = 0.0) -> bool:
+        if self.tp_closes_all:
+            return True
+        return self.tp_qty + max(dust, 0.0) * 1.01 + 1e-9 >= amount
+
+
 def _market_min_amount(exchange: ccxt.Exchange, symbol: str) -> float:
     """Minimum order size in base/contracts (limits + precision step)."""
     market = exchange.market(symbol)
@@ -770,45 +825,77 @@ class BinanceTrader:
         except Exception:
             return amt
 
-    def _has_open_protective_orders(self, symbol: str) -> bool:
-        """True if STOP / TAKE_PROFIT (or algo) already working on symbol."""
+    def _protective_coverage(self, symbol: str) -> ProtectiveCoverage | None:
+        """Open SL/TP on this symbol. None when both order lists failed."""
+        coverage = ProtectiveCoverage()
+        saw = False
         try:
             open_orders = self.exchange.fetch_open_orders(symbol) or []
+            saw = True
         except Exception:
             open_orders = []
-        for o in open_orders:
-            typ = str(o.get("type") or "").upper()
-            if any(x in typ for x in ("STOP", "TAKE_PROFIT", "TRAILING")):
-                return True
-            info = o.get("info") or {}
-            info_typ = str(info.get("type") or info.get("orderType") or "").upper()
-            if any(x in info_typ for x in ("STOP", "TAKE_PROFIT", "TRAILING")):
-                return True
-        # Binance USDT-M conditional / algo open list (best-effort).
-        try:
-            if hasattr(self.exchange, "fapiPrivateGetOpenAlgoOrders"):
-                rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": self.exchange.market(symbol)["id"]})
-                if rows:
-                    return True
-        except Exception:
-            pass
-        try:
-            if hasattr(self.exchange, "fapiPrivateGetOpenOrderStrategy"):
-                rows = self.exchange.fapiPrivateGetOpenOrderStrategy(
-                    {"symbol": self.exchange.market(symbol)["id"]}
+        for order in open_orders:
+            info = order.get("info") or {}
+            typ = str(order.get("type") or info.get("type") or info.get("orderType") or "")
+            remaining = _row_qty(order)
+            try:
+                filled = float(order.get("filled") or 0)
+            except (TypeError, ValueError):
+                filled = 0.0
+            if remaining and filled:
+                remaining = max(0.0, remaining - filled)
+            coverage.add(
+                typ,
+                remaining,
+                close_position=_as_bool(info.get("closePosition")),
+                order_id=str(order.get("id") or info.get("orderId") or info.get("algoId") or ""),
+            )
+        market_id = None
+        info = (getattr(self.exchange, "markets", None) or {}).get(symbol) or {}
+        market_id = info.get("id")
+        if not market_id:
+            try:
+                market_id = self.exchange.market(symbol)["id"]
+            except Exception:
+                market_id = None
+        if market_id and hasattr(self.exchange, "fapiPrivateGetOpenAlgoOrders"):
+            try:
+                rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+                saw = True
+            except Exception:
+                logger.warning("Open algo orders failed for %s", symbol)
+                return None
+            payload = rows
+            if isinstance(payload, dict):
+                payload = (
+                    payload.get("orders") or payload.get("data") or payload.get("rows") or []
                 )
-                if rows:
-                    return True
-        except Exception:
-            pass
-        return False
+            for row in payload or []:
+                if not isinstance(row, dict):
+                    continue
+                typ = str(row.get("orderType") or row.get("type") or "")
+                coverage.add(
+                    typ,
+                    _row_qty(row),
+                    close_position=_as_bool(row.get("closePosition")),
+                    order_id=str(row.get("algoId") or row.get("orderId") or ""),
+                )
+        if not saw:
+            return None
+        return coverage
 
-    def _max_order_qty(self, symbol: str) -> float | None:
+    def _max_order_qty(self, symbol: str, *, market: bool = False) -> float | None:
+        """Lot cap. Market exits use MARKET_LOT_SIZE, which is often tighter than LOT_SIZE."""
         try:
-            market = self.exchange.market(symbol)
+            info = self.exchange.market(symbol)
         except Exception:
-            market = (self.exchange.markets or {}).get(symbol) or {}
-        max_a = ((market.get("limits") or {}).get("amount") or {}).get("max")
+            info = (self.exchange.markets or {}).get(symbol) or {}
+        limits = info.get("limits") or {}
+        max_a = None
+        if market:
+            max_a = (limits.get("market") or {}).get("max")
+        if max_a is None:
+            max_a = (limits.get("amount") or {}).get("max")
         if max_a is None:
             return None
         try:
@@ -816,6 +903,34 @@ class BinanceTrader:
         except (TypeError, ValueError):
             return None
         return max_f if max_f > 0 else None
+
+    def _reduce_market(
+        self,
+        symbol: str,
+        close_side: str,
+        amount: float,
+        reduce_params: dict[str, Any],
+    ) -> tuple[float, str | None]:
+        """Market-reduce `amount` in MARKET_LOT_SIZE chunks. Returns (qty sent, error)."""
+        if amount <= 0:
+            return 0.0, None
+        done = 0.0
+        for raw in split_order_qty(amount, self._max_order_qty(symbol, market=True)):
+            try:
+                qty = float(self.exchange.amount_to_precision(symbol, raw))
+            except Exception:
+                qty = raw
+            if qty <= 0:
+                continue
+            try:
+                self.exchange.create_order(
+                    symbol, "market", close_side, qty, None, dict(reduce_params)
+                )
+            except Exception as e:
+                logger.warning("Market reduce chunk failed: %s", e)
+                return done, str(e)
+            done += qty
+        return done, None
 
     def _place_tp_cover(
         self,
@@ -832,7 +947,7 @@ class BinanceTrader:
         if signal.take_profit is None or amount <= 0:
             return
         stop = float(self.exchange.price_to_precision(symbol, signal.take_profit))
-        chunks = split_order_qty(amount, self._max_order_qty(symbol))
+        chunks = split_order_qty(amount, self._max_order_qty(symbol, market=True))
         covered = 0.0
         n_orders = 0
         for raw in chunks:
@@ -873,14 +988,13 @@ class BinanceTrader:
             qty = leftover
         if qty <= 0:
             return
-        try:
-            self.exchange.create_order(
-                symbol, "market", close_side, qty, None, {**reduce_params}
-            )
+        done, err = self._reduce_market(symbol, close_side, qty, reduce_params)
+        if done > 0 and not err:
             placed.append("NAKED→MARKET")
-        except Exception as e:
-            logger.warning("Naked remainder close failed: %s", e)
-            skipped.append(f"TP({e})")
+            return
+        if err:
+            logger.warning("Naked remainder close failed: %s", err)
+            skipped.append(f"TP({err})")
 
     def _place_binance_protective_orders(
         self,
@@ -897,10 +1011,9 @@ class BinanceTrader:
             return "TP/SL skipped (amount=0)"
         _binance_load_markets(self.exchange)
         close_side = "buy" if signal.side == "sell" else "sell"
-        amount = self._clamp_amount(symbol, amount)
         pos_params = self._position_side_params(signal.side)
         # closePosition closes whole position (no qty) — Binance allows only ONE such order.
-        # Prefer it for SL; use qty reduceOnly for TP.
+        # Prefer it for SL; use qty reduceOnly for TP, split by the market lot cap.
         close_all_params: dict[str, Any] = {
             "workingType": "MARK_PRICE",
             "closePosition": True,
@@ -912,11 +1025,14 @@ class BinanceTrader:
             **pos_params,
         }
         mark = _fetch_mark_price(self.exchange, symbol)
+        try:
+            dust = _market_min_amount(self.exchange, symbol)
+        except Exception:
+            dust = 0.0
         placed: list[str] = []
         skipped: list[str] = []
 
         # If mark already through SL, market-close immediately (STOP would -2021).
-        # Do this BEFORE the "already open" skip so breached positions still close.
         if (
             close_if_sl_breached
             and signal.stop_loss is not None
@@ -928,25 +1044,14 @@ class BinanceTrader:
                 kind="sl",
             )
         ):
-            try:
-                self.exchange.create_order(
-                    symbol,
-                    "market",
-                    close_side,
-                    amount,
-                    None,
-                    {**reduce_params},
-                )
-                return (
-                    f"SL breached (mark {mark} vs SL {signal.stop_loss}) "
-                    "— closed market"
-                )
-            except Exception as e:
-                logger.warning("Emergency SL close failed: %s", e)
-                return f"SL breached but close failed: {e}"
-
-        if self._has_open_protective_orders(symbol):
-            return "TP/SL already open — skip"
+            done, err = self._reduce_market(symbol, close_side, amount, reduce_params)
+            if err and done <= 0:
+                logger.warning("Emergency SL close failed: %s", err)
+                return f"SL breached but close failed: {err}"
+            return (
+                f"SL breached (mark {mark} vs SL {signal.stop_loss}) "
+                "— closed market"
+            )
 
         def _place(
             kind: str,
@@ -1013,24 +1118,23 @@ class BinanceTrader:
                     and close_if_sl_breached
                     and ("-2021" in err or "immediately trigger" in err.lower())
                 ):
-                    try:
-                        self.exchange.create_order(
-                            symbol,
-                            "market",
-                            close_side,
-                            amount,
-                            None,
-                            {**reduce_params},
-                        )
+                    done, err2 = self._reduce_market(
+                        symbol, close_side, amount, reduce_params
+                    )
+                    if done > 0 and not err2:
                         placed.append("SL→MARKET")
                         return
-                    except Exception as e2:
-                        skipped.append(f"SL({e2})")
-                        return
+                    skipped.append(f"SL({err2 or e})")
+                    return
                 logger.warning("Binance %s order failed: %s", kind, e)
                 skipped.append(f"{kind.upper()}({e})")
 
-        # Price already through TP: a resting TP would be rejected. Take the win.
+        coverage = self._protective_coverage(symbol)
+        if coverage is None:
+            return "TP/SL coverage unknown — skip"
+
+        # Price already through TP: a resting TP for the whole size would be rejected.
+        # Close only the qty that no open TP already covers, in market-lot chunks.
         if (
             signal.take_profit is not None
             and mark is not None
@@ -1041,26 +1145,34 @@ class BinanceTrader:
                 kind="tp",
             )
         ):
-            try:
-                self.exchange.create_order(
-                    symbol, "market", close_side, amount, None, {**reduce_params}
-                )
-                return (
-                    f"TP already through (mark {mark} vs TP {signal.take_profit}) "
-                    "— closed market"
-                )
-            except Exception as e:
-                logger.warning("Take-profit market close failed: %s", e)
-                return f"TP already through but close failed: {e}"
+            uncovered = 0.0 if coverage.tp_closes_all else max(0.0, amount - coverage.tp_qty)
+            if uncovered <= max(dust, 0.0) * 1.01:
+                return "TP/SL already open — skip"
+            done, err = self._reduce_market(symbol, close_side, uncovered, reduce_params)
+            if err and done <= 0:
+                logger.warning("Take-profit market close failed: %s", err)
+                return f"TP already through but close failed: {err}"
+            return (
+                f"TP already through (mark {mark} vs TP {signal.take_profit}) "
+                "— closed market"
+            )
 
-        # SL first with close-all; TP covers the full qty (split if above max lot).
-        if signal.stop_loss is not None:
+        sl_needed = signal.stop_loss is not None and not coverage.has_sl
+        tp_shortfall = 0.0
+        if signal.take_profit is not None and not coverage.tp_closes_all:
+            tp_shortfall = max(0.0, amount - coverage.tp_qty)
+        tp_needed = tp_shortfall > max(dust, 0.0) * 1.01
+        if not sl_needed and not tp_needed:
+            return "TP/SL already open — skip"
+
+        # SL first with close-all; TP covers only the qty not already protected.
+        if sl_needed and signal.stop_loss is not None:
             _place("sl", "STOP_MARKET", signal.stop_loss, close_all=True)
-        if signal.take_profit is not None:
+        if tp_needed:
             self._place_tp_cover(
                 symbol,
                 signal,
-                amount,
+                tp_shortfall,
                 close_side=close_side,
                 reduce_params=reduce_params,
                 placed=placed,

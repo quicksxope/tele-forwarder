@@ -37,7 +37,7 @@ from .exchange_runtime import (
 )
 from .parser import Signal
 from .pnl import close_metrics, infer_exit_status, is_position_flat, position_contracts
-from .risk_limits import daily_loss_hit, day_bounds_wib, prefill_invalidated
+from .risk_limits import clamp_to_baseline, daily_loss_hit, day_bounds_wib, prefill_invalidated
 from .settings_menu import register_settings_menu
 from .supabase_store import make_store
 from .trader import (
@@ -291,6 +291,7 @@ async def _risk_block_reason(store, trader: Trader, signal: Signal, cfg: dict) -
     max_open = int(cfg.get("MAX_OPEN_POSITIONS", "6"))
     if hasattr(store, "realized_r_between") and limit_r > 0:
         start, end = day_bounds_wib()
+        start = clamp_to_baseline(start, await _run_sync(_baseline_ts, store))
         try:
             realized = float(await _run_sync(store.realized_r_between, start, end))
         except Exception:
@@ -441,14 +442,16 @@ async def _watch_fill_and_attach_protective(
         end_utc = end.astimezone(timezone.utc)
 
     logger.info("Watching fill for protective TP/SL on %s order %s", symbol, order_id)
+    covered = 0.0
     while True:
-        if end_utc and datetime.now(timezone.utc) >= end_utc:
-            logger.info("Protective watch stopped — window ended for %s", order_id)
-            return
+        window_done = bool(end_utc and datetime.now(timezone.utc) >= end_utc)
         try:
             order = await _run_sync(trader.fetch_order, order_id, symbol)
         except Exception:
             logger.exception("Protective watch fetch_order failed for %s", order_id)
+            if window_done:
+                logger.info("Protective watch stopped — window ended for %s", order_id)
+                return
             await asyncio.sleep(poll_s)
             continue
 
@@ -464,20 +467,25 @@ async def _watch_fill_and_attach_protective(
             except (TypeError, ValueError):
                 filled = 0.0
 
-        if filled > 0:
+        if filled > covered + 1e-9:
             note = await _run_sync(
                 trader.attach_protective_orders, signal, symbol=symbol, amount=filled
             )
+            covered = filled
             logger.info("Protective after fill %s: %s", order_id, note)
             try:
                 await client.send_message(notif_chat, _dm_filled(signal.pair, note or ""))
             except Exception:
                 pass
+
+        if window_done:
+            logger.info("Protective watch stopped — window ended for %s", order_id)
             return
 
-        if status in ("canceled", "cancelled", "expired", "rejected"):
-            logger.info("Protective watch: entry %s is %s — stop", order_id, status)
-            return
+        if status in ("canceled", "cancelled", "expired", "rejected", "closed", "filled"):
+            if filled <= covered + 1e-9:
+                logger.info("Protective watch: entry %s is %s — stop", order_id, status)
+                return
 
         if (
             filled <= 0
@@ -571,10 +579,24 @@ async def _maybe_close_flat_trade(
     return pnl, r, st
 
 
+def _baseline_ts(store) -> datetime | None:
+    if not hasattr(store, "latest_equity_baseline"):
+        return None
+    try:
+        row = store.latest_equity_baseline(source="live")
+    except Exception:
+        logger.exception("baseline lookup failed")
+        return None
+    if not row:
+        return None
+    return row[0]
+
+
 async def _today_realized(store) -> float | None:
     if not hasattr(store, "realized_r_between"):
         return None
     start, end = day_bounds_wib()
+    start = clamp_to_baseline(start, await _run_sync(_baseline_ts, store))
     try:
         return float(await _run_sync(store.realized_r_between, start, end))
     except Exception:
@@ -791,8 +813,6 @@ async def _reconcile_binance_stops(
                 )
                 continue
 
-            if attach_key in attached or sym_key in attached:
-                continue
             if sig.stop_loss is None and sig.take_profit is None:
                 continue
             note = await _run_sync(
@@ -833,6 +853,11 @@ async def _reconcile_binance_stops(
                 except Exception:
                     logger.exception("post-protective flat sync failed #%s", t.id)
 
+            if "already open" in note_l and "skip" in note_l:
+                continue
+            if "coverage unknown" in note_l:
+                logger.warning("Reconcile protective #%s: %s", t.id, note)
+                continue
             if "already open" in note_l or (
                 "placed" in note_l and "not placed" not in note_l
             ):
@@ -1546,11 +1571,14 @@ async def _run_session(cfg: dict, secrets: dict) -> None:
                     result_lines.append(placed)
                     if order_id and (signal.window_end or signal.valid_until):
                         cancel_jobs.append((active_trader, str(order_id)))
-                    note_l = (order.get("protective_note") or "").lower()
                     if (
                         order_id
+                        and not dry_run
                         and hasattr(active_trader, "attach_protective_orders")
-                        and "pending" in note_l
+                        and (
+                            signal.take_profit is not None
+                            or signal.stop_loss is not None
+                        )
                     ):
                         protective_jobs.append((active_trader, str(order_id)))
                 except Exception as e:

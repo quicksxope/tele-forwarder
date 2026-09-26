@@ -39,9 +39,12 @@ class _FakeStore:
         return self._baseline
 
     def trades_between(self, start, end, **kwargs):
+        self.queried = (start, end)
         # Only count trades after baseline.
         if end <= self._baseline[0]:
             return []
+        if start < self._baseline[0]:
+            raise AssertionError(f"query starts before reset: {start}")
         return [
             _FakeTrade(closed_at=datetime.now(timezone.utc), pnl=0.0, status="tp"),
         ]
